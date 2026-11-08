@@ -2116,15 +2116,13 @@ async function _executeTrade(signalId, optionSecId, strike, side, expiry, lots, 
                     <div style="font-size:0.55rem;color:var(--text-secondary);margin-bottom:8px">
                         Buy Order: ${data.buy?.orderId || '?'} (${data.buy?.orderStatus || '?'})
                     </div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;text-align:center;margin-bottom:6px">
-                        <div style="padding:6px;border-radius:6px;background:rgba(239,68,68,0.06)">
-                            <div style="font-size:0.45rem;color:#fca5a5">SL GTT</div>
-                            <div style="font-size:0.6rem;font-weight:600;color:#f87171">${data.sl ? data.sl.orderId : 'Manual needed'}</div>
-                        </div>
-                        <div style="padding:6px;border-radius:6px;background:rgba(34,197,94,0.06)">
-                            <div style="font-size:0.45rem;color:#86efac">Target GTT</div>
-                            <div style="font-size:0.6rem;font-weight:600;color:#4ade80">${data.target ? data.target.orderId : 'Manual needed'}</div>
-                        </div>
+                    <div style="padding:6px;border-radius:6px;background:rgba(239,68,68,0.06);margin-bottom:6px">
+                        <div style="font-size:0.45rem;color:#fca5a5">Target + SL (OCO GTT)</div>
+                        <div style="font-size:0.6rem;font-weight:600;color:#f87171">${
+                            data.protection?.state === 'protected' ? data.protection.order_id
+                            : data.protection?.state === 'awaiting_fill' ? 'Placed automatically after fill'
+                            : 'Manual needed'
+                        }</div>
                     </div>
                     ${warnings}
                 </div>
@@ -2558,7 +2556,11 @@ async function placeIndexManualTrade(side) {
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data?.detail || 'Order placement failed');
-        _setIndexManualStatus(`Executed ${side} ${data.strike} @ ₹${data.entry_price} · SL ₹${data.sl_price}`);
+        const warn = (data.warnings || []).join(' · ');
+        _setIndexManualStatus(
+            `Executed ${side} ${data.strike} @ ₹${data.entry_price} · SL ₹${data.sl_price}` + (warn ? ` · ⚠ ${warn}` : ''),
+            !data.ok,
+        );
         await loadIndexManualOpenTrades();
         await loadIndexSignals(_indexMode); // Moves into upper tracking section
         startTradeTracking();
@@ -2626,7 +2628,7 @@ function startIndexManualMonitor() {
     if (_indexManualMonitorTimer) return;
     _indexManualMonitorTimer = setInterval(async () => {
         try {
-            await fetch(`${API_BASE}/api/index-trading/manual/monitor?index=${_activeIndexKey()}`, { method: 'POST' });
+            // T1/T2 exits run server-side (scheduler "order_safety" job); just refresh the view.
             await loadIndexManualOpenTrades();
             await loadIndexSignals(_indexMode);
         } catch (_) {
@@ -4193,7 +4195,7 @@ async function refreshDhanToken() {
         const data = await response.json();
         
         if (data.success) {
-            statusEl.textContent = `✅ ${data.message} | Old: ${data.old_token} → New: ${data.new_token}`;
+            statusEl.textContent = `✅ ${data.message}${data.method ? ` (via ${data.method})` : ''}`;
             statusEl.style.color = '#22c55e';
         } else {
             statusEl.textContent = `❌ ${data.message}`;
@@ -4659,7 +4661,7 @@ async function testCredentials() {
             statusDiv.innerHTML = `
                 <div class="success-message">
                     ✅ <strong>Credentials Valid!</strong><br>
-                    🔐 <strong>TOTP Code:</strong> ${data.totp_code || 'Generated successfully'}<br>
+                    🔐 <strong>TOTP Code:</strong> Generated successfully<br>
                     <small>Generated at ${new Date().toLocaleTimeString()}</small>
                 </div>
             `;
@@ -4710,8 +4712,7 @@ async function saveCredentials() {
         if (data.success) {
             statusDiv.innerHTML = `
                 <div class="success-message">
-                    ✅ ${data.message}<br>
-                    TOTP Test: ${data.totp_test}
+                    ✅ ${data.message}
                 </div>
             `;
             // Reload status to show updated info
@@ -4881,7 +4882,6 @@ async function generateTokenNow() {
             statusDiv.innerHTML = `
                 <div style="color: #10b981; font-weight: 600;">
                     ✅ <strong>Token Generated!</strong><br>
-                    🔐 Preview: ${data.token_preview}<br>
                     <small>Generated at ${new Date().toLocaleTimeString()}</small>
                 </div>
             `;

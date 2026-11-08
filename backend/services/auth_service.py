@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import secrets
 from datetime import datetime, timedelta
 
@@ -8,6 +9,8 @@ from sqlalchemy.orm import Session
 
 from backend.config import get_config
 from backend.models.tables import AppSession, AppUser
+
+logger = logging.getLogger(__name__)
 
 
 def hash_password(password: str, *, iterations: int = 120000) -> str:
@@ -21,11 +24,8 @@ def hash_password(password: str, *, iterations: int = 120000) -> str:
 
 
 def verify_password(password: str, stored: str) -> bool:
-    if not stored:
+    if not stored or not stored.startswith("pbkdf2_sha256$"):
         return False
-    if not stored.startswith("pbkdf2_sha256$"):
-        # Backward compatible plain-text entry from config for quick setup.
-        return hmac.compare_digest(password, stored)
     try:
         _, iter_str, salt_b64, hash_b64 = stored.split("$", 3)
         iterations = int(iter_str)
@@ -37,20 +37,32 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-def _auth_users_from_config() -> list[dict]:
+_DEFAULT_USERS = [
+    {"username": "admin", "password": "admin123", "role": "admin"},
+    {"username": "readonly", "password": "readonly123", "role": "readonly"},
+]
+
+
+def _auth_users_from_config() -> tuple[list[dict], bool]:
+    """Return (users, using_defaults)."""
     cfg = get_config().get("auth") or {}
     users = cfg.get("users") or []
     if users:
-        return users
-    # Safe defaults for first-run. Must be changed by admin.
-    return [
-        {"username": "admin", "password": "admin123", "role": "admin"},
-        {"username": "readonly", "password": "readonly123", "role": "readonly"},
-    ]
+        return users, False
+    return _DEFAULT_USERS, True
 
 
 def ensure_seed_users(db: Session) -> None:
-    users = _auth_users_from_config()
+    """Seed users only when app_users is empty. Never touches existing users."""
+    if db.query(AppUser).count() > 0:
+        for u in db.query(AppUser).filter(AppUser.username.in_(["admin", "readonly"])).all():
+            if verify_password("admin123", u.password_hash) or verify_password("readonly123", u.password_hash):
+                logger.warning(
+                    "SECURITY: user '%s' still has the DEFAULT password. Change it immediately.",
+                    u.username,
+                )
+        return
+    users, using_defaults = _auth_users_from_config()
     for row in users:
         username = str(row.get("username") or "").strip()
         if not username:
@@ -63,22 +75,13 @@ def ensure_seed_users(db: Session) -> None:
             password_hash = hash_password(str(plain))
         if not password_hash:
             continue
-        user = db.query(AppUser).filter(AppUser.username == username).first()
-        if not user:
-            user = AppUser(
-                username=username,
-                password_hash=password_hash,
-                role=role,
-                is_active=True,
-            )
-            db.add(user)
-        else:
-            user.role = role
-            user.is_active = True
-            # Update hash only if explicitly provided in config.
-            if row.get("password_hash") or row.get("password"):
-                user.password_hash = password_hash
+        db.add(AppUser(username=username, password_hash=password_hash, role=role, is_active=True))
     db.commit()
+    if using_defaults:
+        logger.warning(
+            "SECURITY: seeded DEFAULT users admin/admin123 and readonly/readonly123. "
+            "Change these passwords immediately or define auth.users in config."
+        )
 
 
 def create_session(db: Session, user_id: int) -> AppSession:

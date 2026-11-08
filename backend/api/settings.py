@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 from datetime import date
 
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 
 from backend.models.database import get_db
@@ -435,9 +435,9 @@ async def get_sector_chart_data(sector_name: str, db: Session = Depends(get_db))
         if df is None or df.empty:
             # Auto-recover from expired token and retry once.
             try:
-                from backend.services.token_manager import _renew_and_save_token
-                await _renew_and_save_token()
-                df = await _fetch_chart_df()
+                from backend.services.token_manager import ensure_valid_token
+                if (await ensure_valid_token()).get("action") == "renewed":
+                    df = await _fetch_chart_df()
             except Exception:
                 pass
 
@@ -800,56 +800,24 @@ async def disable_pnl_exit():
 
 @router.post("/token/refresh")
 async def refresh_dhan_token():
-    """Manually refresh/generate the Dhan access token."""
-    try:
-        from backend.services.dhan_client import DhanClient
-        import os
-        
-        client = DhanClient()
-        old_token_preview = "None"
-        
-        # Try to renew existing token first (if available)
-        if client.access_token:
-            old_token_preview = client.access_token[:20] + "..."
-            result = await client.renew_token()
-            
-            if result.get("success") and result.get("new_token"):
-                # Update environment variable for this session
-                os.environ["DHAN_ACCESS_TOKEN"] = result["new_token"]
-                new_token_preview = result["new_token"][:20] + "..."
-                await client.close()
-                return {
-                    "success": True,
-                    "message": "Token renewed successfully",
-                    "old_token": old_token_preview,
-                    "new_token": new_token_preview,
-                    "expires_in": "24 hours",
-                }
-        
-        # OAuth flow requires browser interaction
-        return {
-            "success": False,
-            "message": "Token renewal failed. OAuth flow requires manual token generation.",
-            "instructions": [
-                "1. Go to https://web.dhan.co/",
-                "2. My Profile → Access DhanHQ APIs → Generate Access Token",
-                "3. Set as DHAN_ACCESS_TOKEN environment variable",
-                "4. Restart the application"
-            ]
-        }
-            
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"Token generation error: {str(e)}",
-        }
+    """Manually renew the Dhan access token (RenewToken, then TOTP fallback)."""
+    from backend.services.token_manager import renew_token
+
+    result = await renew_token(force=True)
+    return {
+        **result,
+        "message": "Token renewed successfully" if result.get("success")
+        else (result.get("message") or "Token renewal failed"),
+    }
 
 
 @router.post("/backup/now", response_model=BackupInfo)
-def create_backup_now(custom_path: str = None):
-    """Create an immediate backup of the database."""
-    result = backup_manager.create_backup(custom_path)
-    return result
+def create_backup_now():
+    """Create an immediate backup of the database in the configured backup folder."""
+    try:
+        return backup_manager.create_backup()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/backup/list", response_model=list[BackupInfo])
@@ -861,8 +829,12 @@ def list_backups():
 @router.post("/backup/restore")
 def restore_from_backup(filename: str):
     """Restore the database from a backup file."""
-    result = backup_manager.restore_backup(filename)
-    return result
+    try:
+        return backup_manager.restore_backup(filename)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/backup/export-csv")
@@ -929,7 +901,6 @@ async def save_credentials(credentials: dict):
             return {
                 "success": True,
                 "message": "Credentials saved and validated successfully",
-                "totp_test": test_result["totp_code"]
             }
         else:
             return {
@@ -948,7 +919,8 @@ async def save_credentials(credentials: dict):
 async def test_credentials(credentials: dict):
     """Test credentials without saving."""
     try:
-        result = settings_manager.test_credentials(credentials)
+        result = dict(settings_manager.test_credentials(credentials))
+        result.pop("totp_code", None)
         return result
         
     except Exception as e:
@@ -1005,81 +977,13 @@ def export_credentials():
 
 @router.post("/credentials/generate-token")
 async def generate_token_now():
-    """Manually trigger token generation using UI credentials."""
-    try:
-        from backend.services.token_manager import _renew_and_save_token
-        
-        # Trigger token generation
-        await _renew_and_save_token()
-        
-        # Check if token was generated
-        import os
-        access_token = os.environ.get("DHAN_ACCESS_TOKEN")
-        
-        if access_token:
-            return {
-                "success": True,
-                "message": "Token generated successfully",
-                "token_preview": access_token[:20] + "..."
-            }
-        else:
-            return {
-                "success": False,
-                "message": "Token generation failed - check logs"
-            }
-            
-    except Exception as e:
-            return {
-                "success": False,
-                "message": f"Error generating token: {str(e)}"
-            }
+    """Manually generate a token using saved credentials."""
+    from backend.services.token_manager import renew_token
 
+    result = await renew_token(force=True)
+    return {
+        **result,
+        "message": "Token generated successfully" if result.get("success")
+        else (result.get("message") or "Token generation failed - check logs"),
+    }
 
-@router.get("/debug/credentials")
-async def debug_credentials():
-    """Debug endpoint to check credential loading."""
-    try:
-        from backend.config import get_dhan_credentials
-        from backend.services.settings_manager import settings_manager
-        import os
-        
-        # Check UI credentials
-        ui_creds = settings_manager.load_credentials()
-        
-        # Check environment variables
-        env_creds = {
-            "DHAN_CLIENT_ID": os.environ.get("DHAN_CLIENT_ID"),
-            "DHAN_API_KEY": os.environ.get("DHAN_API_KEY"),
-            "DHAN_PIN": os.environ.get("DHAN_PIN"),
-            "DHAN_TOTP_SECRET": os.environ.get("DHAN_TOTP_SECRET", "")[:10] + "..." if os.environ.get("DHAN_TOTP_SECRET") else None,
-            "DHAN_ACCESS_TOKEN": os.environ.get("DHAN_ACCESS_TOKEN", "")[:20] + "..." if os.environ.get("DHAN_ACCESS_TOKEN") else None,
-        }
-        
-        # Check what get_dhan_credentials returns
-        try:
-            final_creds = get_dhan_credentials()
-            final_creds_safe = {
-                "client_id": final_creds.get("client_id"),
-                "api_key": final_creds.get("api_key", "")[:10] + "..." if final_creds.get("api_key") else None,
-                "has_api_secret": bool(final_creds.get("api_secret")),
-                "has_access_token": bool(final_creds.get("access_token"))
-            }
-        except Exception as e:
-            final_creds_safe = {"error": str(e)}
-        
-        return {
-            "ui_credentials_exist": bool(ui_creds),
-            "ui_credentials": {
-                "client_id": ui_creds.get("client_id") if ui_creds else None,
-                "has_pin": bool(ui_creds.get("pin")) if ui_creds else False,
-                "has_totp_secret": bool(ui_creds.get("totp_secret")) if ui_creds else False,
-            } if ui_creds else None,
-            "environment_variables": env_creds,
-            "final_credentials": final_creds_safe
-        }
-        
-    except Exception as e:
-        return {
-            "error": str(e),
-            "traceback": __import__('traceback').format_exc()
-        }

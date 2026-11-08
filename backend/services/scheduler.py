@@ -6,7 +6,7 @@ Schedule:
   - Once at 4:00 PM post-market
   - Daily sector analysis report at 4:10 PM
   - Weekdays only (Mon-Fri)
-  - Skips NSE holidays
+  - Skips NSE holidays (market.holidays in config.yaml; see market_calendar.py)
 """
 
 import asyncio
@@ -18,30 +18,6 @@ from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 
-NSE_HOLIDAYS_2026 = {
-    date(2026, 1, 26),   # Republic Day
-    date(2026, 2, 17),   # Maha Shivaratri (tentative)
-    date(2026, 3, 10),   # Ramadan / Eid (tentative)
-    date(2026, 3, 30),   # Holi
-    date(2026, 3, 31),   # Holi
-    date(2026, 4, 2),    # Ram Navami
-    date(2026, 4, 3),    # Good Friday
-    date(2026, 4, 14),   # Ambedkar Jayanti
-    date(2026, 5, 1),    # May Day
-    date(2026, 5, 25),   # Buddha Purnima
-    date(2026, 6, 29),   # Eid ul-Adha (tentative)
-    date(2026, 7, 29),   # Muharram (tentative)
-    date(2026, 8, 15),   # Independence Day
-    date(2026, 8, 16),   # Janmashtami (tentative)
-    date(2026, 9, 28),   # Milad-un-Nabi (tentative)
-    date(2026, 10, 2),   # Mahatma Gandhi Jayanti
-    date(2026, 10, 20),  # Dussehra
-    date(2026, 10, 21),  # Dussehra
-    date(2026, 11, 9),   # Diwali (Laxmi Puja)
-    date(2026, 11, 10),  # Diwali (Balipratipada)
-    date(2026, 11, 30),  # Guru Nanak Jayanti
-    date(2026, 12, 25),  # Christmas
-}
 
 _scheduler: AsyncIOScheduler | None = None
 _last_scan_result: dict = {}
@@ -53,65 +29,18 @@ _last_market_direction_notify_result: dict = {}
 
 
 def is_market_day() -> bool:
-    today = date.today()
-    if today.weekday() >= 5:
-        return False
-    if today in NSE_HOLIDAYS_2026:
-        return False
-    return True
+    """Trading day in IST (weekends + market.holidays from config)."""
+    from backend.services.market_calendar import is_trading_day
+
+    return is_trading_day()
 
 
 async def _refresh_dhan_token():
-    """Generate fresh Dhan access token using API key and update environment."""
-    logger.info("=== Token generation starting ===")
-    
-    try:
-        from backend.services.dhan_client import DhanClient
-        import os
-        
-        client = DhanClient()
-        
-        # Try to renew existing token first (if available)
-        if client.access_token:
-            logger.info("Attempting to renew existing token...")
-            result = await client.renew_token()
-            
-            if result.get("success") and result.get("new_token"):
-                # Update environment variable for this session
-                os.environ["DHAN_ACCESS_TOKEN"] = result["new_token"]
-                logger.info("✅ Token renewed successfully")
-                await client.close()
-                return
-            else:
-                logger.warning("Token renewal failed, generating fresh token...")
-        
-        # Try TOTP-based token generation if credentials are available
-        dhan_pin = os.environ.get("DHAN_PIN")
-        totp_secret = os.environ.get("DHAN_TOTP_SECRET")
-        
-        if dhan_pin and totp_secret:
-            logger.info("Attempting TOTP-based token generation...")
-            result = await client.generate_access_token_with_totp(dhan_pin, totp_secret)
-            
-            if result.get("success") and result.get("new_token"):
-                os.environ["DHAN_ACCESS_TOKEN"] = result["new_token"]
-                logger.info("✅ Fresh token generated using TOTP")
-                await client.close()
-                return
-        
-        # Fallback: manual token generation required
-        logger.warning("❌ Token renewal failed and no TOTP credentials available")
-        logger.info("Please manually generate a new token from Dhan web interface:")
-        logger.info("1. Go to https://web.dhan.co/")
-        logger.info("2. My Profile → Access DhanHQ APIs → Generate Access Token")
-        logger.info("3. Set the token as DHAN_ACCESS_TOKEN environment variable")
-        logger.info("")
-        logger.info("OR enable TOTP for fully automatic token generation:")
-        logger.info("1. Setup TOTP in Dhan web interface")
-        logger.info("2. Set DHAN_PIN and DHAN_TOTP_SECRET environment variables")
-            
-    except Exception as e:
-        logger.error(f"Token generation error: {e}", exc_info=True)
+    """Validate the Dhan token and renew it only if needed (single service)."""
+    from backend.services.token_manager import ensure_valid_token
+
+    result = await ensure_valid_token()
+    logger.info("Token check: %s", {k: v for k, v in result.items() if k != "message"})
 
 
 async def _run_scheduled_fno_scan():
@@ -287,6 +216,37 @@ async def _run_daily_market_direction_notify():
         db.close()
 
 
+async def _run_order_safety_jobs():
+    """
+    Every 15s on market days: protect newly-filled entries (OCO / SL GTT) and
+    run manual index T1/T2 exits. Runs server-side so exits don't depend on a
+    browser tab being open.
+    """
+    if not is_market_day():
+        return
+    from backend.models.database import get_session_factory
+    from backend.services.dhan_client import DhanClient
+    from backend.services.order_safety import ensure_protection_all
+    from backend.api.index_trading import run_manual_monitor
+
+    db = get_session_factory()()
+    client = None
+    try:
+        client = DhanClient()
+        for row in await ensure_protection_all(db, client):
+            if row.get("state") not in {"awaiting_fill", "protected"}:
+                logger.warning("Order protection: %s", row)
+        result = await run_manual_monitor(db, index="all")
+        if result.get("events"):
+            logger.info("Manual monitor events: %s", result["events"])
+    except Exception as e:
+        logger.error("Order safety job failed: %s", e, exc_info=True)
+    finally:
+        if client:
+            await client.close()
+        db.close()
+
+
 def start_scheduler():
     """Start the background scheduler with market-hours scan schedule."""
     global _scheduler
@@ -366,6 +326,16 @@ def start_scheduler():
         replace_existing=True,
     )
 
+    # Validate (and renew if needed) once at startup.
+    _scheduler.add_job(
+        _refresh_dhan_token,
+        "date",
+        run_date=datetime.now(),
+        id="token_startup_check",
+        name="Dhan token startup check",
+        replace_existing=True,
+    )
+
     # Telegram callback poller for inline button drill-downs.
     _scheduler.add_job(
         _poll_telegram_callbacks,
@@ -388,6 +358,22 @@ def start_scheduler():
         id="market_direction_daily_6pm",
         name="Market Direction Telegram (6 PM)",
         replace_existing=True,
+    )
+
+    # Protection placement + manual target exits (market hours, every 15s).
+    _scheduler.add_job(
+        _run_order_safety_jobs,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            second="*/15",
+            timezone="Asia/Kolkata",
+        ),
+        id="order_safety",
+        name="Order protection + manual target monitor",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
     _scheduler.start()

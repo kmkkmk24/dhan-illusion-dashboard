@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import date, datetime
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from backend.models.database import get_db
 from backend.models.tables import Signal, Trade
 from backend.services.dhan_client import DhanClient
+from backend.services import order_safety as osf
 from backend.services.index_trading_scanner import IndexTradingScanner, get_index_scan_cache
 from backend.services.trade_tracker import evaluate_hold_status
 
@@ -83,12 +85,9 @@ def _resolve_option_quote_segment(row: dict) -> str:
 
 
 def _market_open_now() -> bool:
-    from zoneinfo import ZoneInfo
+    from backend.services.market_calendar import is_market_open
 
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-    mkt_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    mkt_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    return now_ist.weekday() < 5 and mkt_open <= now_ist <= mkt_close
+    return is_market_open()
 
 
 def _display_index_name(index_key: str) -> str:
@@ -173,7 +172,9 @@ def _parse_manual_plan(notes: str | None, *, quantity: int, lot_size: int) -> di
         return default
     try:
         payload = text.split("manual-index:", 1)[1].strip()
-        obj = json.loads(payload)
+        # raw_decode tolerates trailing text (older code appended " | sl-updated"
+        # etc., which made json.loads fail and silently reset executed_qty to 0).
+        obj, _ = json.JSONDecoder().raw_decode(payload)
         if not isinstance(obj, dict):
             return default
         merged = {**default, **obj}
@@ -502,6 +503,11 @@ async def place_manual_trade(
     side = str(req.side or "").upper()
     if side not in {"CE", "PE"}:
         raise HTTPException(status_code=400, detail="side must be CE or PE")
+    async with osf.single_flight(f"manual-place:{str(req.index).lower()}:{side}"):
+        return await _place_manual_trade_impl(req, side, db)
+
+
+async def _place_manual_trade_impl(req: ManualPlaceTradeRequest, side: str, db: Session):
     if req.lots < 1:
         raise HTTPException(status_code=400, detail="lots must be >= 1")
 
@@ -559,6 +565,14 @@ async def place_manual_trade(
         t2_price = float(req.t2_price) if req.t2_price is not None else round(cmp_price * 1.10, 2)
 
         option_type = "CALL" if side == "CE" else "PUT"
+        if sl_price >= cmp_price:
+            raise HTTPException(status_code=400, detail="SL must be below the entry price")
+        try:
+            expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=502, detail=f"Unexpected expiry format: {expiry}")
+
+        osf.reject_recent_duplicate(db, option["option_security_id"])
         buy_res = await client.place_order(
             security_id=option["option_security_id"],
             exchange_segment=spec.option_quote_segment,
@@ -573,22 +587,9 @@ async def place_manual_trade(
             drv_strike_price=option["strike"],
             after_market_order=not is_open,
         )
-        if buy_res and buy_res.get("error"):
-            raise HTTPException(status_code=400, detail=f"Buy order failed: {buy_res.get('detail', 'Unknown')}")
-
-        sl_res = await client.create_forever_order(
-            security_id=option["option_security_id"],
-            exchange_segment=spec.option_quote_segment,
-            transaction_type="SELL",
-            product_type="MARGIN",
-            order_type="MARKET",
-            order_flag="SINGLE",
-            quantity=quantity,
-            price=0,
-            trigger_price=sl_price,
-        )
-        if sl_res and sl_res.get("error"):
-            raise HTTPException(status_code=400, detail=f"SL order failed: {sl_res.get('detail', 'Unknown')}")
+        if osf.is_error(buy_res):
+            raise HTTPException(status_code=400, detail=f"Buy order failed: {osf.error_detail(buy_res)}")
+        # From here on the buy is live: never raise before the trade is recorded.
 
         signal = Signal(
             security_id=spec.security_id,
@@ -625,7 +626,7 @@ async def place_manual_trade(
             symbol=signal.symbol,
             trade_type="option",
             strike_price=option["strike"],
-            expiry_date=datetime.strptime(expiry, "%Y-%m-%d").date(),
+            expiry_date=expiry_date,
             option_type=side,
             premium=cmp_price,
             lot_size=int(spec.lot_size or 1),
@@ -634,8 +635,8 @@ async def place_manual_trade(
             quantity=quantity,
             entry_date=date.today(),
             status="open",
-            buy_order_id=(buy_res or {}).get("orderId", ""),
-            sl_order_id=(sl_res or {}).get("orderId", ""),
+            buy_order_id=str(buy_res.get("orderId") or ""),
+            sl_order_id="",
             notes=_manual_plan_to_notes({
                 "strategy": "manual-index",
                 "executed_qty": 0,
@@ -651,9 +652,25 @@ async def place_manual_trade(
         db.commit()
         db.refresh(trade)
 
+        # SL GTT only once the buy has filled; otherwise the scheduler's
+        # protection job places it after the fill.
+        if is_open:
+            await osf.wait_for_fill(client, trade.buy_order_id)
+        prot = await osf.ensure_protection(db, client, trade)
+        state = prot.get("state")
+        warnings = []
+        if state == "awaiting_fill":
+            warnings.append("SL GTT will be placed automatically once the buy fills")
+        elif state == "entry_dead":
+            warnings.append(f"Buy order {prot.get('detail')}; trade marked cancelled")
+        elif state != "protected":
+            warnings.append(f"Buy FILLED but SL GTT failed: {prot.get('detail')} — place SL manually now!")
+
         return {
-            "ok": True,
-            "message": "Trade executed and tracking started",
+            "ok": state in {"protected", "awaiting_fill"},
+            "warnings": warnings,
+            "protection": prot,
+            "message": "Trade executed and tracking started" if state == "protected" else "; ".join(warnings),
             "market_open": is_open,
             "trade_id": trade.id,
             "signal_id": signal.id,
@@ -670,8 +687,8 @@ async def place_manual_trade(
             "lots": req.lots,
             "lot_size": lot_size,
             "quantity": quantity,
-            "buy_order_id": (buy_res or {}).get("orderId"),
-            "sl_order_id": (sl_res or {}).get("orderId"),
+            "buy_order_id": trade.buy_order_id,
+            "sl_order_id": trade.sl_order_id or None,
         }
     finally:
         await client.close()
@@ -692,49 +709,76 @@ async def modify_manual_trade_sl(
     if trade.status != "open":
         raise HTTPException(status_code=400, detail=f"Trade is {trade.status}, cannot modify SL")
 
-    segment = "BSE_FNO" if _is_sensex_name(trade.symbol or "") else "NSE_FNO"
+    segment = osf.trade_segment(trade)
     plan = _parse_manual_plan(trade.notes, quantity=int(trade.quantity or 0), lot_size=int(trade.lot_size or 1))
     remaining_qty = _remaining_qty(trade, plan)
     if remaining_qty <= 0:
         raise HTTPException(status_code=400, detail="No remaining quantity to protect")
-    client = DhanClient()
-    try:
-        if trade.sl_order_id:
-            await client.cancel_forever_order(trade.sl_order_id)
+    new_sl_price = float(req.sl_price)
+    old_sl_price = float(trade.sl_price or 0)
 
-        new_sl = await client.create_forever_order(
-            security_id=trade.security_id,
-            exchange_segment=segment,
-            transaction_type="SELL",
-            product_type="MARGIN",
-            order_type="MARKET",
-            order_flag="SINGLE",
-            quantity=remaining_qty,
-            price=0,
-            trigger_price=float(req.sl_price),
-        )
-        if new_sl and new_sl.get("error"):
-            raise HTTPException(status_code=400, detail=f"SL modify failed: {new_sl.get('detail', 'Unknown')}")
-
-        trade.sl_price = float(req.sl_price)
-        trade.sl_order_id = (new_sl or {}).get("orderId", "")
-        trade.notes = (trade.notes or "") + " | sl-updated"
-
+    def _sync_signal():
         if trade.signal_id:
             signal = db.query(Signal).filter(Signal.id == trade.signal_id).first()
             if signal:
-                signal.track_sl_price = float(req.sl_price)
+                signal.track_sl_price = new_sl_price
                 signal.track_last_updated = datetime.utcnow()
 
-        db.commit()
-        return {
-            "ok": True,
-            "trade_id": trade.id,
-            "sl_price": trade.sl_price,
-            "sl_order_id": trade.sl_order_id,
-        }
-    finally:
-        await client.close()
+    async with osf.single_flight(f"trade:{trade.id}"):
+        # Entry not filled yet: no GTT exists. Just record the new level; the
+        # protection job uses it when the fill arrives.
+        if not trade.sl_order_id:
+            trade.sl_price = new_sl_price
+            _sync_signal()
+            db.commit()
+            return {"ok": True, "trade_id": trade.id, "sl_price": trade.sl_price, "sl_order_id": None,
+                    "note": "No live SL GTT yet; new level will be used once the entry fills"}
+
+        client = DhanClient()
+        try:
+            ok, detail = await osf.cancel_gtt_checked(client, trade.sl_order_id)
+            if not ok:
+                # Old SL still live: do NOT add a second one (would double-sell).
+                raise HTTPException(status_code=409, detail=f"SL not changed: {detail}")
+            trade.sl_order_id = ""
+            db.commit()
+
+            new_sl = await osf.place_sl_gtt(
+                client, security_id=trade.security_id, exchange_segment=segment,
+                quantity=remaining_qty, sl_trigger=new_sl_price,
+            )
+            if osf.is_error(new_sl):
+                # Roll back to the previous SL so the position isn't left naked.
+                restore = await osf.place_sl_gtt(
+                    client, security_id=trade.security_id, exchange_segment=segment,
+                    quantity=remaining_qty, sl_trigger=old_sl_price,
+                ) if old_sl_price > 0 else None
+                if restore is not None and not osf.is_error(restore):
+                    trade.sl_order_id = str(restore.get("orderId") or "")
+                    db.commit()
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"SL modify failed ({osf.error_detail(new_sl)}); previous SL ₹{old_sl_price} restored",
+                    )
+                db.commit()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"SL modify failed and previous SL could not be restored — position UNPROTECTED: "
+                    f"{osf.error_detail(new_sl)}",
+                )
+
+            trade.sl_price = new_sl_price
+            trade.sl_order_id = str(new_sl.get("orderId") or "")
+            _sync_signal()
+            db.commit()
+            return {
+                "ok": True,
+                "trade_id": trade.id,
+                "sl_price": trade.sl_price,
+                "sl_order_id": trade.sl_order_id,
+            }
+        finally:
+            await client.close()
 
 
 @router.post("/manual/trades/{trade_id}/targets")
@@ -789,134 +833,159 @@ async def modify_manual_trade_targets(
     }
 
 
+_manual_monitor_lock = asyncio.Lock()
+
+
 @router.post("/manual/monitor")
 async def monitor_manual_targets(
     index: str = Query("all", description="nifty|sensex|all"),
     db: Session = Depends(get_db),
 ):
+    """Manual trigger. The scheduler runs this every 15s during market hours."""
+    return await run_manual_monitor(db, index=index)
+
+
+async def run_manual_monitor(db: Session, *, index: str = "all") -> dict:
+    """
+    Execute T1/T2 partial exits for manual index trades.
+
+    Serialized by a process-wide lock so two callers (scheduler + an API call)
+    can never sell the same target twice. For every exit the SL GTT is
+    cancelled FIRST (checked); if it cannot be cancelled, nothing is sold.
+    """
     if not _market_open_now():
         return {"ok": True, "market_open": False, "checked": 0, "events": []}
+    if _manual_monitor_lock.locked():
+        return {"ok": True, "market_open": True, "checked": 0, "events": [], "skipped": "already running"}
 
-    trades = (
-        db.query(Trade)
-        .filter(
-            Trade.status == "open",
-            Trade.trade_type == "option",
-            Trade.notes.isnot(None),
-            Trade.notes.like("manual-index:%"),
+    async with _manual_monitor_lock:
+        trades = (
+            db.query(Trade)
+            .filter(
+                Trade.status == "open",
+                Trade.trade_type == "option",
+                Trade.notes.isnot(None),
+                Trade.notes.like("manual-index:%"),
+            )
+            .order_by(Trade.created_at.asc())
+            .all()
         )
-        .order_by(Trade.created_at.asc())
-        .all()
-    )
-    if str(index).lower() in {"nifty", "sensex"}:
-        wanted = _display_index_name(index).lower()
-        trades = [t for t in trades if wanted in str(t.symbol or "").lower()]
+        if str(index).lower() in {"nifty", "sensex"}:
+            wanted = _display_index_name(index).lower()
+            trades = [t for t in trades if wanted in str(t.symbol or "").lower()]
+        # Only trades whose entry is filled and protected are eligible for exits.
+        trades = [t for t in trades if t.sl_order_id]
 
-    if not trades:
-        return {"ok": True, "market_open": True, "checked": 0, "events": []}
+        if not trades:
+            return {"ok": True, "market_open": True, "checked": 0, "events": []}
 
-    quote_rows = [{
-        "trade_id": t.id,
-        "index": t.symbol,
-        "option_security_id": t.security_id,
-        "option_quote_segment": "BSE_FNO" if _is_sensex_name(t.symbol or "") else "NSE_FNO",
-    } for t in trades]
-    await _attach_live_option_ltps(quote_rows)
-    live_map = {r["trade_id"]: r.get("live_option_ltp") for r in quote_rows}
+        quote_rows = [{
+            "trade_id": t.id,
+            "index": t.symbol,
+            "option_security_id": t.security_id,
+            "option_quote_segment": osf.trade_segment(t),
+        } for t in trades]
+        await _attach_live_option_ltps(quote_rows)
+        live_map = {r["trade_id"]: r.get("live_option_ltp") for r in quote_rows}
 
-    events: list[dict] = []
-    client = DhanClient()
-    try:
-        for t in trades:
-            ltp = live_map.get(t.id)
-            if ltp is None:
-                continue
-            lot_size = int(t.lot_size or 1)
-            plan = _parse_manual_plan(t.notes, quantity=int(t.quantity or 0), lot_size=lot_size)
-            remaining = _remaining_qty(t, plan)
-            if remaining <= 0:
-                continue
-            segment = "BSE_FNO" if _is_sensex_name(t.symbol or "") else "NSE_FNO"
-            option_type = "CALL" if (t.option_type or "").upper() == "CE" else "PUT"
+        events: list[dict] = []
+        client = DhanClient()
+        try:
+            for t in trades:
+                ltp = live_map.get(t.id)
+                if ltp is None:
+                    continue
+                lot_size = int(t.lot_size or 1)
+                plan = _parse_manual_plan(t.notes, quantity=int(t.quantity or 0), lot_size=lot_size)
+                remaining = _remaining_qty(t, plan)
+                if remaining <= 0:
+                    continue
+                segment = osf.trade_segment(t)
+                option_type = "CALL" if (t.option_type or "").upper() == "CE" else "PUT"
 
-            async def _sell_qty(qty: int) -> dict:
-                return await client.place_order(
+                t1_price = plan.get("t1_price")
+                t1_qty = int(plan.get("t1_qty") or 0)
+                t1_hit = (not plan.get("t1_done")) and t1_price and t1_qty > 0 and float(ltp) >= float(t1_price)
+                t2_price = plan.get("t2_price")
+                t2_qty = int(plan.get("t2_qty") or 0)
+                t2_hit = (not plan.get("t2_done")) and t2_price and float(ltp) >= float(t2_price)
+                if not (t1_hit or t2_hit):
+                    continue
+
+                # Decide total quantity to sell this tick.
+                sell_qty = 0
+                if t1_hit:
+                    sell_qty += min(t1_qty, remaining)
+                if t2_hit:
+                    left = remaining - sell_qty
+                    sell_qty += min(t2_qty, left) if t2_qty > 0 else left
+                sell_qty = min(sell_qty, remaining)
+                if sell_qty <= 0:
+                    continue
+
+                # 1. Cancel SL first. If it is still live, selling could double-sell.
+                ok, detail = await osf.cancel_gtt_checked(client, t.sl_order_id)
+                if not ok:
+                    events.append({"trade_id": t.id, "event": "exit_skipped", "detail": detail})
+                    continue
+                t.sl_order_id = ""
+                db.commit()
+
+                # 2. Sell.
+                sell_res = await client.place_order(
                     security_id=t.security_id,
                     exchange_segment=segment,
                     transaction_type="SELL",
                     product_type="MARGIN",
                     order_type="MARKET",
-                    quantity=qty,
+                    quantity=sell_qty,
                     price=0,
                     validity="DAY",
                     drv_expiry_date=t.expiry_date.strftime("%Y-%m-%d") if t.expiry_date else None,
                     drv_option_type=option_type,
                     drv_strike_price=t.strike_price,
                 )
-
-            # T1 partial exit
-            t1_price = plan.get("t1_price")
-            t1_qty = int(plan.get("t1_qty") or 0)
-            if (not plan.get("t1_done")) and t1_price and t1_qty > 0 and float(ltp) >= float(t1_price):
-                qty = min(t1_qty, remaining)
-                if qty > 0:
-                    sell_res = await _sell_qty(qty)
-                    if not sell_res or sell_res.get("error"):
-                        events.append({"trade_id": t.id, "event": "t1_failed", "detail": sell_res})
-                    else:
-                        plan["executed_qty"] = int(plan.get("executed_qty") or 0) + qty
-                        plan["t1_done"] = True
-                        remaining = _remaining_qty(t, plan)
-                        events.append({"trade_id": t.id, "event": "t1_hit", "qty": qty, "ltp": ltp})
-                        if t.sl_order_id:
-                            await client.cancel_forever_order(t.sl_order_id)
-                        if remaining > 0:
-                            new_sl = await client.create_forever_order(
-                                security_id=t.security_id,
-                                exchange_segment=segment,
-                                transaction_type="SELL",
-                                product_type="MARGIN",
-                                order_type="MARKET",
-                                order_flag="SINGLE",
-                                quantity=remaining,
-                                price=0,
-                                trigger_price=float(t.sl_price or 0),
-                            )
-                            if new_sl and not new_sl.get("error"):
-                                t.sl_order_id = new_sl.get("orderId", "")
-
-            # T2 full remaining
-            t2_price = plan.get("t2_price")
-            t2_qty = int(plan.get("t2_qty") or 0)
-            remaining = _remaining_qty(t, plan)
-            if (not plan.get("t2_done")) and t2_price and remaining > 0 and float(ltp) >= float(t2_price):
-                qty = min(max(t2_qty, 0), remaining) if t2_qty > 0 else remaining
-                qty = qty if qty > 0 else remaining
-                sell_res = await _sell_qty(qty)
-                if not sell_res or sell_res.get("error"):
-                    events.append({"trade_id": t.id, "event": "t2_failed", "detail": sell_res})
+                if osf.is_error(sell_res):
+                    events.append({"trade_id": t.id, "event": "exit_failed", "detail": osf.error_detail(sell_res)})
                 else:
-                    plan["executed_qty"] = int(plan.get("executed_qty") or 0) + qty
-                    plan["t2_done"] = True
-                    events.append({"trade_id": t.id, "event": "t2_hit", "qty": qty, "ltp": ltp})
-                    if t.sl_order_id:
-                        await client.cancel_forever_order(t.sl_order_id)
-                    if _remaining_qty(t, plan) <= 0:
-                        t.status = "closed"
-                        t.exit_date = date.today()
-                        if t.signal_id:
-                            sig = db.query(Signal).filter(Signal.id == t.signal_id).first()
-                            if sig:
-                                sig.is_tracked = False
-                                sig.track_status = "TARGET-HIT"
-                                sig.track_status_reason = "T2 target reached"
-                                sig.track_last_updated = datetime.utcnow()
-            t.notes = _manual_plan_to_notes(plan)
+                    plan["executed_qty"] = int(plan.get("executed_qty") or 0) + sell_qty
+                    if t1_hit:
+                        plan["t1_done"] = True
+                        events.append({"trade_id": t.id, "event": "t1_hit", "ltp": ltp})
+                    if t2_hit:
+                        plan["t2_done"] = True
+                        events.append({"trade_id": t.id, "event": "t2_hit", "ltp": ltp})
+                    events.append({"trade_id": t.id, "event": "sold", "qty": sell_qty})
+                t.notes = _manual_plan_to_notes(plan)
+                db.commit()
 
-        db.commit()
-    finally:
-        await client.close()
-    return {"ok": True, "market_open": True, "checked": len(trades), "events": events}
+                # 3. Re-protect whatever is left (also after a failed sell).
+                left = _remaining_qty(t, plan)
+                if left > 0:
+                    new_sl = await osf.place_sl_gtt(
+                        client, security_id=t.security_id, exchange_segment=segment,
+                        quantity=left, sl_trigger=float(t.sl_price or 0),
+                    )
+                    if osf.is_error(new_sl):
+                        logger.error("UNPROTECTED POSITION trade=%s: %s", t.id, osf.error_detail(new_sl))
+                        events.append({"trade_id": t.id, "event": "sl_replace_failed",
+                                       "detail": osf.error_detail(new_sl)})
+                    else:
+                        t.sl_order_id = str(new_sl.get("orderId") or "")
+                else:
+                    t.status = "closed"
+                    t.exit_date = date.today()
+                    if t.signal_id:
+                        sig = db.query(Signal).filter(Signal.id == t.signal_id).first()
+                        if sig:
+                            sig.is_tracked = False
+                            sig.track_status = "TARGET-HIT"
+                            sig.track_status_reason = "T2 target reached"
+                            sig.track_last_updated = datetime.utcnow()
+                db.commit()
+        finally:
+            await client.close()
+        return {"ok": True, "market_open": True, "checked": len(trades), "events": events}
 
 
 @router.post("/track/{signal_id}")

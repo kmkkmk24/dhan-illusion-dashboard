@@ -1193,11 +1193,8 @@ async def live_advisory(
     dte = max(0, (exp_date - today).days)
 
     # Check market hours
-    from zoneinfo import ZoneInfo
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-    mkt_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    mkt_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_market_open = (now_ist.weekday() < 5 and mkt_open <= now_ist <= mkt_close)
+    from backend.services.market_calendar import is_market_open as _is_open
+    is_market_open = _is_open()
 
     if not is_market_open:
         return {
@@ -1449,128 +1446,136 @@ class PlaceTradeRequest(BaseModel):
 @router.post("/place-trade")
 async def place_trade(req: PlaceTradeRequest, db: Session = Depends(get_db)):
     """
-    Place a limit buy order + forever SL order + forever target order.
-    All three are placed; if buy fails, SL/target are not placed.
+    Place a LIMIT buy (AMO if the market is closed), record the trade, then
+    protect it with ONE OCO GTT (target + SL) once the buy is filled.
+
+    Protection is never placed against an unfilled buy. If the buy has not
+    filled within a few seconds, the scheduler's protection job places the
+    OCO later (see order_safety.ensure_protection_all).
     """
+    import re
+    from backend.services import order_safety as osf
+
     signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
 
+    # ── Validate everything BEFORE any order goes out ──
+    side = req.side.upper()
+    if side not in {"CE", "PE"}:
+        raise HTTPException(status_code=400, detail="side must be CE or PE")
+    try:
+        expiry_date = datetime.strptime(req.expiry, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="expiry must be YYYY-MM-DD")
+    if expiry_date < date.today():
+        raise HTTPException(status_code=400, detail="expiry is in the past")
+    if req.lots < 1 or req.lot_size < 1:
+        raise HTTPException(status_code=400, detail="lots and lot_size must be >= 1")
+    if not (0 < req.sl_trigger_price < req.limit_price < req.target_price):
+        raise HTTPException(status_code=400, detail="Require 0 < SL trigger < limit price < target")
+
     quantity = req.lots * req.lot_size
-    option_type = "CALL" if req.side.upper() == "CE" else "PUT"
-    import re
+    option_type = "CALL" if side == "CE" else "PUT"
     safe_strike = str(int(req.strike)) if req.strike == int(req.strike) else str(req.strike).replace(".", "p")
     correlation_base = re.sub(r'[^a-zA-Z0-9_-]', '', f"ill-{signal.symbol[:8]}-{safe_strike}")
 
-    # Detect market hours (NSE: 9:15 AM - 3:30 PM IST, Mon-Fri)
-    from zoneinfo import ZoneInfo
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-    market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_market_open = (now_ist.weekday() < 5 and market_open <= now_ist <= market_close)
+    from backend.services.market_calendar import is_market_open as _is_open
+    is_market_open = _is_open()
 
-    client = DhanClient()
-    results = {"buy": None, "sl": None, "target": None, "errors": [], "is_amo": not is_market_open}
+    async with osf.single_flight(f"place:{req.option_security_id}"):
+        osf.reject_recent_duplicate(db, req.option_security_id)
 
-    try:
-        # 1. Place LIMIT BUY order (AMO if market is closed)
-        buy_result = await client.place_order(
-            security_id=req.option_security_id,
-            exchange_segment="NSE_FNO",
-            transaction_type="BUY",
-            product_type="MARGIN",
-            order_type="LIMIT",
-            quantity=quantity,
-            price=req.limit_price,
-            validity="DAY",
-            correlation_id=f"{correlation_base}-buy",
-            drv_expiry_date=req.expiry,
-            drv_option_type=option_type,
-            drv_strike_price=req.strike,
-            after_market_order=not is_market_open,
-        )
+        client = DhanClient()
+        results = {"buy": None, "protection": None, "errors": [], "is_amo": not is_market_open}
+        try:
+            buy_result = await client.place_order(
+                security_id=req.option_security_id,
+                exchange_segment="NSE_FNO",
+                transaction_type="BUY",
+                product_type="MARGIN",
+                order_type="LIMIT",
+                quantity=quantity,
+                price=req.limit_price,
+                validity="DAY",
+                correlation_id=f"{correlation_base}-buy",
+                drv_expiry_date=req.expiry,
+                drv_option_type=option_type,
+                drv_strike_price=req.strike,
+                after_market_order=not is_market_open,
+            )
+            if osf.is_error(buy_result):
+                results["errors"].append(f"Buy order failed: {osf.error_detail(buy_result)}")
+                return JSONResponse(status_code=400, content=results)
+            results["buy"] = buy_result
 
-        if buy_result and buy_result.get("error"):
-            results["errors"].append(f"Buy order failed: {buy_result.get('detail', 'Unknown error')}")
+            # The buy is live: record it right away so it can never go untracked.
+            trade = Trade(
+                signal_id=req.signal_id,
+                security_id=req.option_security_id,
+                symbol=signal.symbol,
+                trade_type="option",
+                strike_price=req.strike,
+                expiry_date=expiry_date,
+                option_type=side,
+                premium=req.limit_price,
+                lot_size=req.lot_size,
+                entry_price=req.limit_price,
+                sl_price=req.sl_trigger_price,
+                target_price=req.target_price,
+                quantity=quantity,
+                entry_date=date.today(),
+                status="open",
+                buy_order_id=str(buy_result.get("orderId") or ""),
+                sl_order_id="",
+                target_order_id="",
+                notes=f"Buy: {buy_result.get('orderId', '?')}",
+            )
+            db.add(trade)
+            db.commit()
+            db.refresh(trade)
+            results["trade_id"] = trade.id
+
+            # Protect only after fill (AMO cannot fill now; the scheduler job handles it).
+            if is_market_open:
+                await osf.wait_for_fill(client, trade.buy_order_id)
+            prot = await osf.ensure_protection(db, client, trade)
+            results["protection"] = prot
+
+            state = prot.get("state")
+            if state == "protected":
+                results["message"] = "Trade placed; OCO target/SL is live"
+            elif state == "awaiting_fill":
+                results["message"] = "Buy placed; OCO target/SL will be placed automatically once it fills"
+            elif state == "entry_dead":
+                results["errors"].append(f"Buy order {prot.get('detail')}; trade marked cancelled")
+                results["message"] = "Buy was not accepted"
+            else:
+                results["errors"].append(
+                    f"Buy is FILLED but protective OCO failed: {prot.get('detail')} — place SL manually now!"
+                )
+                results["message"] = "Buy filled, position UNPROTECTED"
+            return results
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Place trade error")
+            results["errors"].append(str(e))
+            return JSONResponse(status_code=500, content=results)
+        finally:
             await client.close()
-            return JSONResponse(status_code=400, content=results)
 
-        results["buy"] = buy_result
 
-        # 2. Place Forever SL order (SELL when premium drops to SL)
-        sl_result = await client.create_forever_order(
-            security_id=req.option_security_id,
-            exchange_segment="NSE_FNO",
-            transaction_type="SELL",
-            product_type="MARGIN",
-            order_type="MARKET",
-            order_flag="SINGLE",
-            quantity=quantity,
-            price=0,
-            trigger_price=req.sl_trigger_price,
-            correlation_id=f"{correlation_base}-sl",
-        )
+async def _cancel_trade_gtts(client, trade: Trade) -> list[str]:
+    """Cancel every broker-side GTT for a trade. Returns errors for any still live."""
+    from backend.services import order_safety as osf
 
-        if sl_result and sl_result.get("error"):
-            results["errors"].append(f"SL order failed: {sl_result.get('detail', 'Unknown error')} — Place manually!")
-        else:
-            results["sl"] = sl_result
-
-        # 3. Place Forever Target order (SELL when premium rises to target)
-        target_result = await client.create_forever_order(
-            security_id=req.option_security_id,
-            exchange_segment="NSE_FNO",
-            transaction_type="SELL",
-            product_type="MARGIN",
-            order_type="LIMIT",
-            order_flag="SINGLE",
-            quantity=quantity,
-            price=req.target_price,
-            trigger_price=req.target_price,
-            correlation_id=f"{correlation_base}-tgt",
-        )
-
-        if target_result and target_result.get("error"):
-            results["errors"].append(f"Target order failed: {target_result.get('detail', 'Unknown error')} — Place manually!")
-        else:
-            results["target"] = target_result
-
-        await client.close()
-
-        # 4. Record trade in DB
-        trade = Trade(
-            signal_id=req.signal_id,
-            security_id=req.option_security_id,
-            symbol=signal.symbol,
-            trade_type="option",
-            strike_price=req.strike,
-            expiry_date=datetime.strptime(req.expiry, "%Y-%m-%d").date(),
-            option_type=req.side.upper(),
-            premium=req.limit_price,
-            lot_size=req.lot_size,
-            entry_price=req.limit_price,
-            sl_price=req.sl_trigger_price,
-            target_price=req.target_price,
-            quantity=quantity,
-            entry_date=date.today(),
-            status="open",
-            buy_order_id=buy_result.get("orderId", ""),
-            sl_order_id=sl_result.get("orderId", "") if sl_result else "",
-            target_order_id=target_result.get("orderId", "") if target_result else "",
-            notes=f"Buy: {buy_result.get('orderId', '?')} | SL: {sl_result.get('orderId', '?') if sl_result else 'FAILED'} | Target: {target_result.get('orderId', '?') if target_result else 'FAILED'}",
-        )
-        db.add(trade)
-        db.commit()
-        db.refresh(trade)
-
-        results["trade_id"] = trade.id
-        results["message"] = "Trade placed successfully" if not results["errors"] else "Buy placed, but some orders need attention"
-        return results
-
-    except Exception as e:
-        logger.error(f"Place trade error: {e}")
-        await client.close()
-        raise HTTPException(status_code=500, detail=str(e))
+    errors = []
+    for oid in {trade.sl_order_id, trade.target_order_id} - {None, ""}:
+        ok, detail = await osf.cancel_gtt_checked(client, oid)
+        if not ok:
+            errors.append(detail)
+    return errors
 
 
 @router.post("/trades/{trade_id}/close")
@@ -1580,23 +1585,35 @@ async def close_trade(
     exit_price: float = Query(0, description="Exit premium (0 if not exited on market)"),
     db: Session = Depends(get_db),
 ):
-    """Mark a trade as closed/cancelled."""
+    """
+    Mark a trade as closed/cancelled. If it is still open, its protective GTTs
+    are cancelled first so no stray SELL can fire on a position you no longer hold.
+    """
     trade = db.query(Trade).filter(Trade.id == trade_id).first()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
 
+    errors: list[str] = []
+    if trade.status == "open" and (trade.sl_order_id or trade.target_order_id):
+        client = DhanClient()
+        try:
+            errors = await _cancel_trade_gtts(client, trade)
+        finally:
+            await client.close()
+        if errors:
+            raise HTTPException(
+                status_code=409,
+                detail="Trade left open because GTTs are still live: " + "; ".join(errors),
+            )
+
     trade.status = reason
+    trade.exit_date = date.today()
     if exit_price > 0:
         trade.exit_price = exit_price
-        trade.exit_date = date.today()
         trade.pnl = round((exit_price - trade.entry_price) * trade.quantity, 2)
         trade.pnl_percentage = round(((exit_price - trade.entry_price) / trade.entry_price) * 100, 1) if trade.entry_price else 0
-        if trade.entry_date:
-            trade.days_held = (date.today() - trade.entry_date).days
-    else:
-        trade.exit_date = date.today()
-        if trade.entry_date:
-            trade.days_held = (date.today() - trade.entry_date).days
+    if trade.entry_date:
+        trade.days_held = (date.today() - trade.entry_date).days
 
     db.commit()
     return {"status": "ok", "trade_id": trade_id, "new_status": reason}
@@ -1609,85 +1626,95 @@ async def exit_trade_now(
 ):
     """
     Exit a trade immediately:
-    1. Place MARKET SELL order
-    2. Cancel SL and Target GTT orders
-    3. Update trade in DB
+    1. Cancel protective GTTs first (abort if one is still live — selling while a
+       GTT is live risks a double SELL / naked short)
+    2. If the entry never filled, cancel the buy instead of selling
+    3. Otherwise place a MARKET SELL for the filled quantity
+    4. Update trade in DB
     """
+    from backend.services import order_safety as osf
+
     trade = db.query(Trade).filter(Trade.id == trade_id).first()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
     if trade.status != "open":
         raise HTTPException(status_code=400, detail=f"Trade is already {trade.status}")
 
-    from zoneinfo import ZoneInfo
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-    mkt_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    mkt_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_market_open = (now_ist.weekday() < 5 and mkt_open <= now_ist <= mkt_close)
-
+    from backend.services.market_calendar import is_market_open as _is_open
+    is_market_open = _is_open()
     if not is_market_open:
         raise HTTPException(status_code=400, detail="Market is closed. Exit manually on Dhan or wait for market hours.")
 
     option_type = "CALL" if trade.option_type == "CE" else "PUT"
-    client = DhanClient()
-    results = {"sell": None, "sl_cancelled": None, "target_cancelled": None, "errors": []}
+    results = {"sell": None, "gtts_cancelled": False, "errors": []}
 
-    try:
-        # 1. Place MARKET SELL
-        sell_result = await client.place_order(
-            security_id=trade.security_id,
-            exchange_segment="NSE_FNO",
-            transaction_type="SELL",
-            product_type="MARGIN",
-            order_type="MARKET",
-            quantity=trade.quantity,
-            price=0,
-            validity="DAY",
-            drv_expiry_date=trade.expiry_date.strftime("%Y-%m-%d") if trade.expiry_date else "",
-            drv_option_type=option_type,
-            drv_strike_price=trade.strike_price or 0,
-        )
+    async with osf.single_flight(f"exit:{trade.id}"):
+        client = DhanClient()
+        try:
+            gtt_errors = await _cancel_trade_gtts(client, trade)
+            if gtt_errors:
+                results["errors"] = gtt_errors + ["Nothing sold. Exit on Dhan directly."]
+                return JSONResponse(status_code=409, content=results)
+            results["gtts_cancelled"] = True
+            trade.sl_order_id = ""
+            trade.target_order_id = ""
+            db.commit()
 
-        if sell_result and sell_result.get("error"):
-            results["errors"].append(f"Sell failed: {sell_result.get('detail', 'Unknown')}")
+            status, filled = osf.parse_order_status(await client.get_order_by_id(trade.buy_order_id or ""))
+            if trade.buy_order_id and status not in {osf.FILLED, osf.PARTIAL}:
+                if status not in osf.DEAD_STATUSES:
+                    cancel = await client.cancel_order(trade.buy_order_id)
+                    if osf.is_error(cancel):
+                        results["errors"].append(f"Could not cancel unfilled buy: {osf.error_detail(cancel)}")
+                        return JSONResponse(status_code=409, content=results)
+                trade.status = "cancelled"
+                trade.exit_date = date.today()
+                db.commit()
+                results["trade_id"] = trade.id
+                results["message"] = "Entry was not filled; buy order cancelled"
+                return results
+
+            sell_qty = filled if (status == osf.PARTIAL and filled > 0) else int(trade.quantity or 0)
+            sell_result = await client.place_order(
+                security_id=trade.security_id,
+                exchange_segment=osf.trade_segment(trade),
+                transaction_type="SELL",
+                product_type="MARGIN",
+                order_type="MARKET",
+                quantity=sell_qty,
+                price=0,
+                validity="DAY",
+                drv_expiry_date=trade.expiry_date.strftime("%Y-%m-%d") if trade.expiry_date else "",
+                drv_option_type=option_type,
+                drv_strike_price=trade.strike_price or 0,
+            )
+            if osf.is_error(sell_result):
+                # GTTs are already gone, so the position is unprotected. Say so loudly.
+                results["errors"].append(
+                    f"Sell failed: {osf.error_detail(sell_result)}. GTTs were cancelled — "
+                    "position is UNPROTECTED, exit on Dhan now."
+                )
+                trade.notes = (trade.notes or "") + " | EXIT FAILED, GTTs cancelled"
+                db.commit()
+                return JSONResponse(status_code=400, content=results)
+            results["sell"] = sell_result
+
+            if status == osf.PARTIAL:
+                await client.cancel_order(trade.buy_order_id)
+            trade.status = "closed"
+            trade.exit_date = date.today()
+            if trade.entry_date:
+                trade.days_held = (date.today() - trade.entry_date).days
+            trade.notes = (trade.notes or "") + f" | EXIT: {sell_result.get('orderId', '?')}"
+            db.commit()
+
+            results["trade_id"] = trade.id
+            results["message"] = "Position closed"
+            return results
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Exit trade error")
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
             await client.close()
-            return JSONResponse(status_code=400, content=results)
-
-        results["sell"] = sell_result
-
-        # 2. Cancel SL GTT
-        if trade.sl_order_id:
-            try:
-                sl_cancel = await client.cancel_forever_order(trade.sl_order_id)
-                results["sl_cancelled"] = sl_cancel
-            except Exception as e:
-                results["errors"].append(f"SL GTT cancel failed: {e}")
-
-        # 3. Cancel Target GTT
-        if trade.target_order_id:
-            try:
-                tgt_cancel = await client.cancel_forever_order(trade.target_order_id)
-                results["target_cancelled"] = tgt_cancel
-            except Exception as e:
-                results["errors"].append(f"Target GTT cancel failed: {e}")
-
-        await client.close()
-
-        # 4. Update trade in DB
-        trade.status = "closed"
-        trade.exit_date = date.today()
-        if trade.entry_date:
-            trade.days_held = (date.today() - trade.entry_date).days
-        trade.notes = (trade.notes or "") + f" | EXIT: {sell_result.get('orderId', '?')}"
-        db.commit()
-
-        results["trade_id"] = trade.id
-        results["message"] = "Position closed" + (" (some GTT cancels failed)" if results["errors"] else "")
-        return results
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Exit trade error: {e}")
-        await client.close()
-        raise HTTPException(status_code=500, detail=str(e))

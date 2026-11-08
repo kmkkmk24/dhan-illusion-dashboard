@@ -10,6 +10,7 @@ import os
 import time
 from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pyotp
 
@@ -24,6 +25,14 @@ BASE_URL = "https://api.dhan.co/v2"
 
 # Dhan /charts/historical rejects long spans (DH-905); stay under ~1 year per request.
 MAX_HISTORICAL_CHUNK_CALENDAR_DAYS = 330
+
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _ist_naive(ts) -> datetime:
+    """Epoch seconds -> naive IST datetime, independent of the host time zone."""
+    return datetime.fromtimestamp(ts, _IST).replace(tzinfo=None)
 
 
 def _coerce_security_id_for_api(security_id: str) -> str | int:
@@ -82,6 +91,13 @@ class DhanClient:
         }
 
     async def _get_client(self) -> httpx.AsyncClient:
+        # Pick up a token renewed by token_manager since this client was built,
+        # so long-lived clients never keep sending a stale token.
+        env_token = os.environ.get("DHAN_ACCESS_TOKEN")
+        if env_token and env_token != self.access_token:
+            self.access_token = env_token
+            if self._http_client is not None and not self._http_client.is_closed:
+                self._http_client.headers["access-token"] = env_token
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(
                 base_url=BASE_URL,
@@ -147,7 +163,7 @@ class DhanClient:
                 df = pd.DataFrame(
                     {
                         "timestamp": [
-                            datetime.fromtimestamp(ts) for ts in data["timestamp"]
+                            _ist_naive(ts) for ts in data["timestamp"]
                         ],
                         "open": data["open"],
                         "high": data["high"],
@@ -336,7 +352,7 @@ class DhanClient:
                 return None
 
             df = pd.DataFrame({
-                "timestamp": [datetime.fromtimestamp(ts) for ts in data["timestamp"]],
+                "timestamp": [_ist_naive(ts) for ts in data["timestamp"]],
                 "open": data["open"],
                 "high": data["high"],
                 "low": data["low"],

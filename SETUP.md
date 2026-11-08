@@ -53,13 +53,7 @@ echo $DHAN_TOTP_SECRET
 pip install -r requirements.txt
 ```
 
-### 4. Install Dependencies
-
-```bash
-pip3 install -r requirements.txt
-```
-
-### 5. Configure Application
+### 4. Configure Application
 
 ```bash
 # Copy configuration template
@@ -69,11 +63,11 @@ cp config.yaml.example config.yaml
 # All credentials come from environment variables
 ```
 
-### 6. Run the Application
+### 5. Run the Application
 
 ```bash
 # Start the backend server
-python -m backend.main
+python run.py
 
 # Open your browser to:
 # http://localhost:8000

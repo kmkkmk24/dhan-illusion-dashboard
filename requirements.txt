@@ -1,41 +1,40 @@
 # ============================================================
 # Dhan Illusion Dashboard - Python Dependencies
+# Tested on Python 3.13 (Windows); all packages ship pre-built wheels.
+# Floors match the versions the test suite (pytest) passes against.
 # ============================================================
 
-# Web Framework
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
+# Web framework (pydantic v2)
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+python-multipart>=0.0.12
 
-# HTTP Client
+# HTTP client (pinned: TestClient + Dhan client tested on this version)
 httpx==0.27.2
 
-# Data Processing
-pandas==2.1.3
-numpy==1.26.4
+# Data processing
+numpy>=2.1,<3
+pandas>=2.2.3,<3
 
 # Database
-sqlalchemy==2.0.23
-alembic==1.12.1
+sqlalchemy>=2.0.36,<2.1
+alembic>=1.14
 
-# Configuration
-pyyaml==6.0.1
-
-# Scheduling
+# Configuration / scheduling
+pyyaml>=6.0.2
 apscheduler==3.10.4
 
-# Authentication & Security
-pyotp==2.9.0
-cryptography==41.0.7
+# Authentication & security
+pyotp>=2.9.0
+cryptography>=43
 
-# Date/Time
-python-dateutil==2.8.2
-
-# Logging
-python-multipart==0.0.6
-
-# Development
-pytest==7.4.3
-pytest-asyncio==0.21.1
+# Date/time
+python-dateutil>=2.9.0
 
 # Fundamentals (open-source)
 Bharat-sm-data==4.0.1
+
+# Testing
+pytest>=8.3
+pytest-asyncio>=0.24

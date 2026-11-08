@@ -59,6 +59,13 @@ sector:
   rs_periods: [5, 10, 20, 50]
 
 # ── Backup Settings ──
+market:
+  # NSE trading holidays (YYYY-MM-DD), added to the built-in 2026 list.
+  # Add each new year's list from nseindia.com: otherwise scheduled scans and
+  # order flows treat every weekday as a trading day.
+  holidays: []
+  #  - 2027-01-26
+
 backup:
   path: ""
   schedule: "daily"

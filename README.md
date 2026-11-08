@@ -2,8 +2,8 @@
 
 A professional **Trade Suggestion & Tracking Platform** for Swing Trades and Stock Options (F&O) using Dhan HQ APIs.
 
-![Python](https://img.shields.io/badge/python-v3.8+-blue.svg)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)
+![Python](https://img.shields.io/badge/python-3.10+%20(tested%203.13)-blue.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ## 🌟 Features
@@ -35,7 +35,7 @@ A professional **Trade Suggestion & Tracking Platform** for Swing Trades and Sto
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.8+
+- Python 3.10+ (tested on 3.13)
 - Dhan Trading Account
 - TOTP enabled on Dhan account
 
@@ -62,10 +62,12 @@ A professional **Trade Suggestion & Tracking Platform** for Swing Trades and Sto
    ```bash
    cp config.yaml.example config.yaml
    ```
+   - Add this year's NSE holidays under `market.holidays` (scans and order flows treat every other weekday as a trading day).
+   - Define your login users under `auth.users`. With none configured, first start seeds `admin/admin123` and `readonly/readonly123` and logs a warning until you change them.
 
 5. **Run the application**
    ```bash
-   python -m backend.main
+   python run.py
    ```
 
 6. **Open in browser**
@@ -151,17 +153,14 @@ The application uses **automatic token management**:
 pip3 install -r requirements.txt
 
 # Run with auto-reload
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Testing
 
 ```bash
-# Run tests
+# Run the test suite (no live Dhan calls; uses a temp config, in-memory DB and fake broker)
 pytest
-
-# Run with coverage
-pytest --cov=backend
 ```
 
 ## 📈 Production Deployment

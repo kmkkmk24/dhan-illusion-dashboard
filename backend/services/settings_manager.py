@@ -188,11 +188,39 @@ class SettingsManager:
             "export_date": str(Path(__file__).stat().st_mtime)
         }
     
+    # ── Access token persistence (survives restarts / reloads) ──
+
+    @property
+    def token_file(self) -> Path:
+        return self.settings_dir / "token.enc"
+
+    def save_access_token(self, token: str, saved_at: str) -> bool:
+        try:
+            with open(self.token_file, "wb") as f:
+                f.write(self._encrypt_data({"access_token": token, "saved_at": saved_at}))
+            os.chmod(self.token_file, 0o600)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving access token: {e}")
+            return False
+
+    def load_access_token(self) -> Optional[Dict[str, str]]:
+        try:
+            if not self.token_file.exists():
+                return None
+            with open(self.token_file, "rb") as f:
+                return self._decrypt_data(f.read())
+        except Exception as e:
+            logger.error(f"Error loading access token: {e}")
+            return None
+
     def clear_credentials(self) -> bool:
         """Clear all stored credentials."""
         try:
             if self.settings_file.exists():
                 self.settings_file.unlink()
+            if self.token_file.exists():
+                self.token_file.unlink()
             if self.key_file.exists():
                 self.key_file.unlink()
             

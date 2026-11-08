@@ -23,6 +23,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# httpx logs full request URLs at INFO (the TOTP login URL contains the PIN).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -38,15 +41,14 @@ async def lifespan(app: FastAPI):
         db.close()
 
     from backend.services.scheduler import start_scheduler, stop_scheduler
-    from backend.services.token_manager import start_token_manager, stop_token_manager
+    from backend.services.token_manager import load_persisted_token
 
-    start_scheduler()
-    start_token_manager()
+    load_persisted_token()
+    start_scheduler()  # includes token startup check + 06:00 IST renewal
 
     yield
 
     stop_scheduler()
-    stop_token_manager()
     logger.info("Shutting down Trade Scanner Platform.")
 
 
@@ -56,6 +58,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+ADMIN_ONLY_PREFIXES = ("/api/settings/credentials", "/api/settings/debug")
 
 
 @app.middleware("http")
@@ -76,6 +81,8 @@ async def auth_middleware(request, call_next):
         if not user:
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
         request.state.user = {"id": user.id, "username": user.username, "role": user.role}
+        if path.startswith(ADMIN_ONLY_PREFIXES) and user.role != "admin":
+            return JSONResponse(status_code=403, content={"detail": "Admin access required"})
         if method not in {"GET", "HEAD", "OPTIONS"} and user.role != "admin":
             return JSONResponse(status_code=403, content={"detail": "Admin access required"})
     finally:

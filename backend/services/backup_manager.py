@@ -6,24 +6,57 @@ even while the application is running.
 """
 
 import logging
-import os
+import re
 import sqlite3
-import shutil
 from datetime import datetime
 from pathlib import Path
 
-from backend.config import get_config, get_db_path
+from backend.config import DATA_DIR, get_config, get_db_path
 
 logger = logging.getLogger(__name__)
 
 
-def get_backup_path() -> Path | None:
-    """Get the configured backup directory path."""
+_BACKUP_NAME_RE = re.compile(r"^trades_[A-Za-z0-9_-]+\.db$")
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def get_backup_path() -> Path:
+    """Configured backup directory, or data/backups when none is set."""
     config = get_config()
-    backup_path = config.get("backup", {}).get("path", "")
-    if not backup_path:
-        return None
-    return Path(backup_path)
+    backup_path = (config.get("backup") or {}).get("path", "")
+    return Path(backup_path) if backup_path else DATA_DIR / "backups"
+
+
+def _resolve_backup_file(backup_dir: Path, backup_filename: str) -> Path:
+    """
+    Only accept a bare file name of the form trades_*.db that resolves inside
+    the backup directory (blocks ../ traversal and absolute paths).
+    """
+    name = str(backup_filename or "")
+    if not _BACKUP_NAME_RE.match(name):
+        raise ValueError("Invalid backup file name")
+    root = backup_dir.resolve()
+    target = (root / name).resolve()
+    if target.parent != root:
+        raise ValueError("Invalid backup file name")
+    if not target.is_file():
+        raise FileNotFoundError(f"Backup file not found: {name}")
+    return target
+
+
+def _validate_sqlite_backup(path: Path) -> None:
+    """Make sure the file really is a healthy SQLite DB with a trades table."""
+    with open(path, "rb") as f:
+        if f.read(16) != _SQLITE_HEADER:
+            raise ValueError("Not a SQLite database file")
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("Backup failed SQLite integrity check")
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades'").fetchone():
+            raise ValueError("Backup has no trades table")
+    finally:
+        conn.close()
 
 
 def create_backup(custom_path: str | None = None) -> dict:
@@ -40,12 +73,6 @@ def create_backup(custom_path: str | None = None) -> dict:
         raise FileNotFoundError(f"Database not found at {db_path}")
 
     backup_dir = Path(custom_path) if custom_path else get_backup_path()
-    if backup_dir is None:
-        raise ValueError(
-            "No backup path configured. Set backup.path in config.yaml "
-            "or provide a custom_path."
-        )
-
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -94,7 +121,7 @@ def _enforce_retention_policy(backup_dir: Path) -> None:
 def list_backups() -> list[dict]:
     """List all available backups."""
     backup_dir = get_backup_path()
-    if backup_dir is None or not backup_dir.exists():
+    if not backup_dir.exists():
         return []
 
     backups = sorted(
@@ -118,32 +145,42 @@ def list_backups() -> list[dict]:
 
 def restore_backup(backup_filename: str) -> dict:
     """
-    Restore the database from a backup file.
+    Restore the database from a backup file in the backup directory.
 
-    Copies the backup file over the current database.
-    The current database is first backed up as trades_pre_restore_<timestamp>.db.
+    The current database is first saved as trades_pre_restore_<timestamp>.db.
+    Uses SQLite's backup API (not a file copy) so the live DB is replaced
+    consistently even with open connections; the SQLAlchemy pool is then reset.
     """
     backup_dir = get_backup_path()
-    if backup_dir is None:
-        raise ValueError("No backup path configured.")
-
-    backup_filepath = backup_dir / backup_filename
-    if not backup_filepath.exists():
-        raise FileNotFoundError(f"Backup file not found: {backup_filepath}")
+    backup_filepath = _resolve_backup_file(backup_dir, backup_filename)
+    _validate_sqlite_backup(backup_filepath)
 
     db_path = get_db_path()
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     if db_path.exists():
-        pre_restore_name = f"trades_pre_restore_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db"
-        pre_restore_path = backup_dir / pre_restore_name
-        shutil.copy2(str(db_path), str(pre_restore_path))
+        pre_restore_path = backup_dir / f"trades_pre_restore_{stamp}.db"
+        src, dst = sqlite3.connect(str(db_path)), sqlite3.connect(str(pre_restore_path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
         logger.info(f"Pre-restore backup created: {pre_restore_path}")
 
-    shutil.copy2(str(backup_filepath), str(db_path))
+    src, dst = sqlite3.connect(str(backup_filepath)), sqlite3.connect(str(db_path))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+    from backend.models.database import get_engine
+    get_engine().dispose()
     logger.info(f"Database restored from: {backup_filepath}")
 
     return {
-        "restored_from": backup_filename,
+        "restored_from": backup_filepath.name,
         "restored_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -158,8 +195,8 @@ def export_trades_csv(db_path_override: str | None = None) -> str:
 
     df = pd.read_sql_table("trades", engine)
 
-    backup_dir = get_backup_path()
-    export_dir = backup_dir if backup_dir else db_path.parent
+    export_dir = get_backup_path()
+    export_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     csv_path = export_dir / f"trades_export_{timestamp}.csv"

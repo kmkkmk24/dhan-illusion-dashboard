@@ -477,10 +477,9 @@ class MarketDirectionPredictor:
         }
 
     def _next_trading_day(self, d: date) -> date:
-        nxt = d + timedelta(days=1)
-        while nxt.weekday() >= 5:
-            nxt += timedelta(days=1)
-        return nxt
+        from backend.services.market_calendar import next_trading_day
+
+        return next_trading_day(d)
 
     def _upsert_prediction(self, prediction: dict[str, Any], *, horizon: str) -> None:
         try:

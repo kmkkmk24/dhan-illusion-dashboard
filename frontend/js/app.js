@@ -31,8 +31,7 @@ function applyRoleAccess() {
     const adminButtons = [
         'btn-index-scan', 'btn-index-scan-positional',
         'btn-index-ce-buy', 'btn-index-pe-buy',
-        'btn-index-manual-refresh', 'btn-scan-swing',
-        'btn-scan-fno', 'btn-refresh-instruments', 'btn-value-refresh',
+        'btn-index-manual-refresh', 'btn-refresh-instruments', 'btn-value-refresh',
         'btn-refresh-sectors', 'btn-sector-telegram'
     ];
     adminButtons.forEach(id => {
@@ -348,7 +347,7 @@ function switchTab(tab) {
     if (tab === 'index') { loadIndexSignals(); }
     if (tab === 'value') { loadValueInvesting(); }
     if (tab === 'journal') loadTrades();
-    if (tab === 'settings') { loadBackups(); loadSectorDisplay(); }
+    if (tab === 'settings') { loadSettingsTab(); }
     if (tab !== 'index' && _indexManualMonitorTimer) {
         clearInterval(_indexManualMonitorTimer);
         _indexManualMonitorTimer = null;
@@ -4032,241 +4031,176 @@ async function _journalSave(tradeId) {
     } catch (e) { alert('Error: ' + e.message); }
 }
 
-// --- Scanner ---
+// --- Settings: shared UI helpers ---
 
-async function runScan(section) {
-    const btn = document.getElementById(`btn-scan-${section}`);
-    const statusEl = document.getElementById('scan-status');
+const ST_ICONS = {
+    ok: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg>',
+    warn: '<svg viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',
+    err: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>',
+    info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>',
+    eye: '<svg viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>',
+    eyeOff: '<svg viewBox="0 0 24 24"><path d="M9.9 4.2A10 10 0 0 1 12 4c6.4 0 10 8 10 8a17 17 0 0 1-2.2 3.2M6.6 6.6C3.6 8.5 2 12 2 12s3.6 8 10 8a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="m2 2 20 20"/></svg>',
+};
+
+function stEsc(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+    ));
+}
+
+/** Render an inline alert into element `id`. `html` must already be escaped. */
+function stAlert(id, kind, html) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.innerHTML = html ? `<div class="st-alert st-alert--${kind}">${ST_ICONS[kind] || ''}<div>${html}</div></div>` : '';
+}
+
+/** Put a button into a busy state; returns a function that restores it. */
+function stBusy(btn, label) {
+    if (!btn) return () => {};
+    const original = btn.innerHTML;
     btn.disabled = true;
-    const label = section === 'fno' ? 'F&O' : 'Swing';
-    btn.innerHTML = `<span class="spinner"></span> Scanning ${label}...`;
-    statusEl.textContent = `Running ${label} scan... This may take a few minutes.`;
-    statusEl.style.color = '#6366f1';
+    btn.innerHTML = `<span class="spinner"></span>${stEsc(label)}`;
+    return () => { btn.disabled = false; btn.innerHTML = original; };
+}
 
-    try {
-        const response = await fetch(`${API_BASE}/api/settings/scan/run?section=${section}`, { method: 'POST' });
-        const data = await response.json();
-        
-        // Check if response indicates an error
-        if (data.error) {
-            throw new Error(data.message || 'Scan failed');
-        }
-        
-        const s = data.summary || {};
-        let msg = data.message || 'Scan completed';
-        
-        // Add summary details if available
-        if (s.scanned) {
-            msg += ` | Scanned: ${s.scanned}`;
-            if (s.new_signals || s.vcp_signals) msg += `, New signals: ${s.new_signals || s.vcp_signals || 0}`;
-            if (s.updated) msg += `, Updated: ${s.updated}`;
-            if (s.exploded) msg += `, Exploded: ${s.exploded}`;
-            if (s.invalidated) msg += `, Invalidated: ${s.invalidated}`;
-        }
-        if (s.errors) msg += ` | Errors: ${s.errors}`;
-        if (s.rate_limited) msg += ` | Rate limited: ${s.rate_limited}`;
-        
-        statusEl.textContent = msg;
-        statusEl.style.color = '#22c55e';
+function stKv(items) {
+    return items.map(([label, value, tone]) => `
+        <div class="st-kv-item">
+            <span class="st-kv-label">${stEsc(label)}</span>
+            <span class="st-kv-value${tone ? ` st-kv-value--${tone}` : ''}" title="${stEsc(value)}">${stEsc(value)}</span>
+        </div>`).join('');
+}
 
-        if (s.top_sectors) loadSectorDisplay();
+function stTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso);
+    return d.toLocaleString(undefined, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
 
-        if (section === 'fno') loadFnoSignals();
-        else loadSignals('swing');
-    } catch (err) {
-        statusEl.textContent = `Scan failed: ${err.message}`;
-        statusEl.style.color = '#ef4444';
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = section === 'fno' ? 'Scan F&O Stocks' : 'Scan Swing Trades';
+async function stFetchJson(url, options) {
+    const response = await fetch(url, options);
+    let data = null;
+    try { data = await response.json(); } catch (_) { /* non-JSON body */ }
+    if (!response.ok) {
+        const detail = (data && (data.detail || data.message)) || `HTTP ${response.status}`;
+        throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
     }
+    return data;
 }
 
-async function runSectorAnalysis() {
-    const btn = document.getElementById('btn-sector-analysis');
-    const statusEl = document.getElementById('scan-status');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Analyzing...';
-    statusEl.textContent = 'Running sector momentum analysis...';
-    statusEl.style.color = '#6366f1';
-
-    try {
-        const response = await fetch(`${API_BASE}/api/settings/scan/sectors`, { method: 'POST' });
-        const data = await response.json();
-        statusEl.textContent = `Sector analysis complete. ${data.sectors.length} sectors analyzed.`;
-        statusEl.style.color = '#22c55e';
-        displaySectorResults(data.sectors);
-    } catch (err) {
-        statusEl.textContent = `Sector analysis failed: ${err.message}`;
-        statusEl.style.color = '#ef4444';
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = 'Sector Analysis Only';
+// Connection pill in the page header, derived from credentials + token state.
+const _stConn = { credentials: null, token: null };
+function updateConnectionPill() {
+    const pill = document.getElementById('st-conn-pill');
+    if (!pill) return;
+    const { credentials, token } = _stConn;
+    let kind = '', text = 'Checking connection…';
+    if (credentials !== null && token !== null) {
+        if (token) { kind = 'ok'; text = 'Access token loaded'; }
+        else if (credentials) { kind = 'warn'; text = 'Credentials saved · no token yet'; }
+        else { kind = 'err'; text = 'Not connected to Dhan'; }
     }
+    pill.className = `st-pill${kind ? ` st-pill--${kind}` : ''}`;
+    pill.innerHTML = `<span class="st-dot"></span>${stEsc(text)}`;
 }
 
-async function loadSectorDisplay() {
-    try {
-        const response = await fetch(`${API_BASE}/api/settings/sectors/top`);
-        const sectors = await response.json();
-        if (sectors.length) displaySectorResults(sectors);
-    } catch (err) {
-        console.error('Error loading sectors:', err);
-    }
+function loadSettingsTab() {
+    loadCredentialsStatus();
+    loadTokenStatus();
+    loadBackups();
 }
 
-function displaySectorResults(sectors) {
-    const container = document.getElementById('sector-momentum');
-    const listEl = document.getElementById('sector-list');
-    container.classList.remove('hidden');
-
-    const rows = sectors.map((s, i) => {
-        const scoreColor = s.combined_score >= 0.7 ? '#22c55e' :
-                           s.combined_score >= 0.4 ? '#eab308' : 'var(--text-muted)';
-        const rank = i + 1;
-        const badges = [
-            s.is_above_20ema ? '<span class="text-2xs px-1 py-0.5 rounded" style="background:rgba(34,197,94,0.12);color:#22c55e">20EMA</span>' : '',
-            s.is_above_50ema ? '<span class="text-2xs px-1 py-0.5 rounded" style="background:rgba(34,197,94,0.12);color:#22c55e">50EMA</span>' : '',
-            s.is_making_higher_highs ? '<span class="text-2xs px-1 py-0.5 rounded" style="background:rgba(59,130,246,0.12);color:#3b82f6">HH</span>' : '',
-        ].filter(Boolean).join(' ');
-
-        return `
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-light)">
-                <div style="display:flex;align-items:center;gap:8px">
-                    <span class="text-2xs" style="color:var(--text-muted);width:16px">#${rank}</span>
-                    <span class="text-xs font-medium" style="color:var(--text-primary)">${s.sector_name}</span>
-                    <span style="display:flex;gap:4px">${badges}</span>
-                </div>
-                <div style="display:flex;align-items:center;gap:12px">
-                    <span class="text-2xs" style="color:var(--text-muted)">RS: ${(s.relative_strength * 100).toFixed(0)}%</span>
-                    <span class="text-2xs" style="color:var(--text-muted)">PA: ${(s.price_action_score * 100).toFixed(0)}%</span>
-                    <span class="text-xs font-semibold" style="color:${scoreColor}">${(s.combined_score * 100).toFixed(0)}%</span>
-                </div>
-            </div>`;
-    }).join('');
-
-    listEl.innerHTML = rows;
-}
+// --- Settings: maintenance ---
 
 async function resetSignals() {
-    if (!confirm('This will delete ALL signals and their history. Are you sure?')) return;
+    if (!confirm('Delete ALL scanner signals and their history?\n\nJournal trades are kept. This cannot be undone.')) return;
+    const restore = stBusy(document.getElementById('btn-reset-signals'), 'Resetting…');
     try {
-        const response = await fetch(`${API_BASE}/api/settings/reset/signals`, { method: 'POST' });
-        const data = await response.json();
-        alert(`Reset complete. Deleted ${data.deleted_signals} signals and ${data.deleted_history} history records.`);
+        const data = await stFetchJson(`${API_BASE}/api/settings/reset/signals`, { method: 'POST' });
+        stAlert('reset-status', 'ok',
+            `Deleted <strong>${stEsc(data.deleted_signals)}</strong> signals and <strong>${stEsc(data.deleted_history)}</strong> history records.`);
     } catch (err) {
-        alert(`Reset failed: ${err.message}`);
+        stAlert('reset-status', 'err', `Reset failed: ${stEsc(err.message)}`);
+    } finally {
+        restore();
     }
 }
-
-// --- Settings ---
 
 async function refreshInstruments() {
-    const btn = document.getElementById('btn-refresh-instruments');
-    const statusEl = document.getElementById('instruments-status');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Refreshing...';
-    statusEl.textContent = '';
-
+    const restore = stBusy(document.getElementById('btn-refresh-instruments'), 'Refreshing…');
+    stAlert('instruments-status', 'info', 'Downloading the scrip master from Dhan. This can take a minute…');
     try {
-        const response = await fetch(`${API_BASE}/api/settings/instruments/refresh`, { method: 'POST' });
-        const data = await response.json();
-        statusEl.textContent = `Done! ${data.total_equity} stocks loaded, ${data.fno_symbols} F&O symbols found. (${data.added} new, ${data.updated} updated)`;
-        statusEl.style.color = '#22c55e';
+        const d = await stFetchJson(`${API_BASE}/api/settings/instruments/refresh`, { method: 'POST' });
+        stAlert('instruments-status', 'ok',
+            `<strong>${stEsc(d.total_equity)}</strong> stocks · <strong>${stEsc(d.fno_symbols)}</strong> F&amp;O symbols`
+            + `<small>${stEsc(d.added)} new, ${stEsc(d.updated)} updated</small>`);
     } catch (err) {
-        statusEl.textContent = `Error: ${err.message}`;
-        statusEl.style.color = '#ef4444';
+        stAlert('instruments-status', 'err', `Refresh failed: ${stEsc(err.message)}`);
     } finally {
-        btn.disabled = false;
-        btn.innerHTML = 'Refresh Instruments';
-    }
-}
-
-async function refreshDhanToken() {
-    const btn = document.getElementById('btn-refresh-token');
-    const statusEl = document.getElementById('token-status');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Refreshing...';
-    statusEl.textContent = 'Contacting Dhan API...';
-    statusEl.style.color = '#6366f1';
-
-    try {
-        const response = await fetch(`${API_BASE}/api/settings/token/refresh`, { method: 'POST' });
-        const data = await response.json();
-        
-        if (data.success) {
-            statusEl.textContent = `✅ ${data.message}${data.method ? ` (via ${data.method})` : ''}`;
-            statusEl.style.color = '#22c55e';
-        } else {
-            statusEl.textContent = `❌ ${data.message}`;
-            statusEl.style.color = '#ef4444';
-        }
-    } catch (err) {
-        statusEl.textContent = `Error: ${err.message}`;
-        statusEl.style.color = '#ef4444';
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = 'Refresh Token';
+        restore();
     }
 }
 
 async function createBackup() {
+    const restore = stBusy(document.getElementById('btn-backup-now'), 'Backing up…');
     try {
-        const response = await fetch(`${API_BASE}/api/settings/backup/now`, { method: 'POST' });
-        const data = await response.json();
-        alert(`Backup created: ${data.filename} (${data.size_mb} MB)`);
+        const d = await stFetchJson(`${API_BASE}/api/settings/backup/now`, { method: 'POST' });
+        stAlert('backup-status', 'ok', `Backup created: <strong>${stEsc(d.filename)}</strong><small>${stEsc(d.size_mb)} MB</small>`);
         loadBackups();
     } catch (err) {
-        alert(`Backup failed: ${err.message}`);
+        stAlert('backup-status', 'err', `Backup failed: ${stEsc(err.message)}`);
+    } finally {
+        restore();
     }
 }
 
 async function exportCSV() {
+    const restore = stBusy(document.getElementById('btn-export-csv'), 'Exporting…');
     try {
-        const response = await fetch(`${API_BASE}/api/settings/backup/export-csv`, { method: 'POST' });
-        const data = await response.json();
-        alert(`Trades exported to: ${data.path}`);
+        const d = await stFetchJson(`${API_BASE}/api/settings/backup/export-csv`, { method: 'POST' });
+        stAlert('backup-status', 'ok', `Trades exported<small>${stEsc(d.path)}</small>`);
     } catch (err) {
-        alert(`Export failed: ${err.message}`);
+        stAlert('backup-status', 'err', `Export failed: ${stEsc(err.message)}`);
+    } finally {
+        restore();
     }
 }
 
 async function loadBackups() {
+    const list = document.getElementById('backup-list');
+    if (!list) return;
     try {
-        const response = await fetch(`${API_BASE}/api/settings/backup/list`);
-        const backups = await response.json();
-
+        const backups = await stFetchJson(`${API_BASE}/api/settings/backup/list`);
         if (!backups.length) {
-            document.getElementById('backup-list').innerHTML = `<p class="text-xs" style="color:var(--text-muted)">No backups found.</p>`;
+            list.innerHTML = '<div class="st-empty">No backups yet. Create one before risky changes.</div>';
             return;
         }
-
-        const rows = backups.slice(0, 10).map(b => `
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-light)">
-                <div>
-                    <p class="text-xs font-medium" style="color:var(--text-primary)">${b.filename}</p>
-                    <p class="text-2xs" style="color:var(--text-muted)">${b.created_at} &middot; ${b.size_mb} MB</p>
+        const rows = backups.slice(0, 15).map(b => `
+            <div class="st-row">
+                <div class="st-row-main">
+                    <div class="st-row-title st-row-title--mono">${stEsc(b.filename)}</div>
+                    <div class="st-row-meta">${stEsc(b.created_at)} · ${stEsc(b.size_mb)} MB</div>
                 </div>
-                <button onclick="restoreBackup('${b.filename}')"
-                    class="text-2xs text-brand-500 hover:text-brand-400 font-medium">Restore</button>
+                <button type="button" class="st-btn st-btn--ghost st-btn--sm" data-backup="${stEsc(b.filename)}"
+                    onclick="restoreBackup(this.dataset.backup)">Restore</button>
             </div>`).join('');
-
-        document.getElementById('backup-list').innerHTML = `
-            <h4 class="text-xs font-medium mb-1.5" style="color:var(--text-muted)">Recent Backups</h4>
-            ${rows}`;
+        list.innerHTML = `<div class="st-list-head">Recent backups (${backups.length})</div>${rows}`;
     } catch (err) {
-        console.error('Error loading backups:', err);
+        list.innerHTML = `<div class="st-empty">Could not load backups: ${stEsc(err.message)}</div>`;
     }
 }
 
 async function restoreBackup(filename) {
-    if (!confirm(`Restore database from ${filename}? A pre-restore backup will be created first.`)) return;
+    if (!confirm(`Restore the database from ${filename}?\n\nA safety copy of the current database is taken first.`)) return;
     try {
-        const response = await fetch(`${API_BASE}/api/settings/backup/restore?filename=${encodeURIComponent(filename)}`, { method: 'POST' });
-        const data = await response.json();
-        alert(`Database restored from ${data.restored_from}. Please refresh the page.`);
+        const d = await stFetchJson(
+            `${API_BASE}/api/settings/backup/restore?filename=${encodeURIComponent(filename)}`, { method: 'POST' });
+        stAlert('backup-status', 'ok', `Restored from <strong>${stEsc(d.restored_from)}</strong><small>Reload the page to see restored data.</small>`);
+        loadBackups();
     } catch (err) {
-        alert(`Restore failed: ${err.message}`);
+        stAlert('backup-status', 'err', `Restore failed: ${stEsc(err.message)}`);
     }
 }
 
@@ -4277,32 +4211,28 @@ function debounceSearch(query) {
 }
 
 async function searchInstruments(query) {
-    if (!query || query.length < 2) {
-        document.getElementById('search-results').innerHTML = '';
+    const box = document.getElementById('search-results');
+    if (!box) return;
+    if (!query || query.trim().length < 2) {
+        box.innerHTML = '';
         return;
     }
     try {
-        const response = await fetch(`${API_BASE}/api/settings/instruments/search?q=${encodeURIComponent(query)}`);
-        const results = await response.json();
-
+        const results = await stFetchJson(`${API_BASE}/api/settings/instruments/search?q=${encodeURIComponent(query.trim())}`);
         if (!results.length) {
-            document.getElementById('search-results').innerHTML = `<p class="text-xs" style="color:var(--text-muted)">No instruments found.</p>`;
+            box.innerHTML = '<div class="st-empty">No instruments match that search.</div>';
             return;
         }
-
-        const rows = results.map(r => `
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-light)">
-                <div>
-                    <span class="text-xs font-medium" style="color:var(--text-primary)">${r.symbol}</span>
-                    <span class="text-2xs" style="color:var(--text-muted);margin-left:6px">${r.display_name || ''}</span>
-                    ${r.is_fno ? '<span class="text-2xs px-1.5 py-0.5 rounded-full" style="background:rgba(168,85,247,0.12);color:#a78bfa;margin-left:6px">F&O</span>' : ''}
+        box.innerHTML = results.map(r => `
+            <div class="st-row">
+                <div class="st-row-main">
+                    <div class="st-row-title">${stEsc(r.symbol)}${r.is_fno ? '<span class="st-badge">F&amp;O</span>' : ''}</div>
+                    <div class="st-row-meta">${stEsc(r.display_name || '')}</div>
                 </div>
-                <span class="text-2xs" style="color:var(--text-muted)">${r.security_id}${r.is_fno ? ` \u00b7 Lot: ${r.lot_size}` : ''}</span>
+                <div class="st-row-side">${stEsc(r.security_id)}${r.is_fno && r.lot_size ? ` · lot ${stEsc(r.lot_size)}` : ''}</div>
             </div>`).join('');
-
-        document.getElementById('search-results').innerHTML = rows;
     } catch (err) {
-        console.error('Error searching instruments:', err);
+        box.innerHTML = `<div class="st-empty">Search failed: ${stEsc(err.message)}</div>`;
     }
 }
 
@@ -4496,7 +4426,6 @@ function startApp() {
     initSidebar();
     loadPnlGuardStatus();
     switchTab('sectors');
-    loadCredentialsStatus();
     applyRoleAccess();
 }
 
@@ -4515,395 +4444,194 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.loginAppUser = loginAppUser;
     window.logoutAppUser = logoutAppUser;
     
-    console.log('🚀 App initialized. Functions available globally.');
-    console.log('🔧 Debug commands:');
-    console.log('  - testCredentials() - Test the credentials');
-    console.log('  - togglePassword("inputId") - Toggle password visibility');
-    console.log('  - getCredentialsFromForm() - Get form data');
-    console.log('  - loadCredentialsStatus() - Reload status');
 });
 
-// ── Credentials Management Functions ──
+// ── Settings: Dhan credentials & access token ──
 
 function togglePassword(inputId) {
-    console.log('Toggle password called for:', inputId);
-    
     const input = document.getElementById(inputId);
-    if (!input) {
-        console.error('Input not found:', inputId);
-        return;
-    }
-    
-    const container = input.parentElement;
-    const button = container.querySelector('.toggle-password');
-    
-    if (!button) {
-        console.error('Toggle button not found for:', inputId);
-        return;
-    }
-    
-    console.log('Current input type:', input.type);
-    
-    if (input.type === 'password') {
-        input.type = 'text';
-        button.textContent = '🙈';
-        console.log('Changed to text type');
-    } else {
-        input.type = 'password';
-        button.textContent = '👁️';
-        console.log('Changed to password type');
-    }
+    const button = input && input.parentElement.querySelector('.toggle-password');
+    if (!input || !button) return;
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    button.innerHTML = show ? ST_ICONS.eyeOff : ST_ICONS.eye;
+    button.setAttribute('aria-label', show ? 'Hide value' : 'Show value');
 }
 
 async function loadCredentialsStatus() {
+    const listDiv = document.getElementById('credentialsList');
+    if (!listDiv) return;
     try {
-        const statusDiv = document.getElementById('credentialsStatus');
-        const listDiv = document.getElementById('credentialsList');
-        
-        if (!statusDiv || !listDiv) {
-            console.log('Credentials status elements not found, skipping load');
-            return;
-        }
-        
-        const response = await fetch('/api/settings/credentials/status');
-        const data = await response.json();
-        
+        const data = await stFetchJson(`${API_BASE}/api/settings/credentials/status`);
+        _stConn.credentials = !!data.configured;
         if (data.configured) {
-            statusDiv.innerHTML = `<div class="success-message">✅ Credentials configured and ready</div>`;
-            
-            const creds = data.credentials;
-            listDiv.innerHTML = `
-                <div class="credentials-list">
-                    <div><strong>Client ID:</strong> ${creds.client_id}</div>
-                    <div><strong>API Key:</strong> ${creds.api_key}</div>
-                    <div><strong>API Secret:</strong> ${creds.api_secret}</div>
-                    <div><strong>PIN:</strong> ${creds.pin}</div>
-                    <div><strong>TOTP Secret:</strong> ${creds.totp_secret}</div>
-                </div>
-            `;
-            
-            // Load current values into form (only non-sensitive fields)
-            const clientIdInput = document.getElementById('clientId');
-            const apiKeyInput = document.getElementById('apiKey');
-            
-            if (clientIdInput) clientIdInput.value = creds.client_id;
-            if (apiKeyInput) apiKeyInput.value = creds.api_key;
-            
-            // Update placeholders for sensitive fields
-            const apiSecretInput = document.getElementById('apiSecret');
-            const pinInput = document.getElementById('dhanPin');
-            const totpInput = document.getElementById('totpSecret');
-            
-            if (apiSecretInput) apiSecretInput.placeholder = `Current: ${creds.api_secret}`;
-            if (pinInput) pinInput.placeholder = `Current: ${creds.pin}`;
-            if (totpInput) totpInput.placeholder = `Current: ${creds.totp_secret}`;
+            const raw = data.credentials || {};
+            // Collapse long mask runs: "*****************demo" -> "••••demo"
+            const c = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, String(v ?? '').replace(/\*+/g, '••••')]));
+            listDiv.innerHTML = stKv([
+                ['Client ID', c.client_id || '—'],
+                ['API key', c.api_key || '—'],
+                ['API secret', c.api_secret || '—'],
+                ['PIN', c.pin || '—'],
+                ['TOTP secret', c.totp_secret || '—'],
+            ]);
+            const setVal = (id, v) => { const el = document.getElementById(id); if (el && !el.value) el.value = v || ''; };
+            setVal('clientId', c.client_id);
+            const ph = (id, v) => {
+                const el = document.getElementById(id);
+                if (!el || !v) return;
+                if (!el.dataset.ph) el.dataset.ph = el.placeholder;
+                el.placeholder = 'Saved · re-enter to change';
+            };
+            ph('apiKey', c.api_key);
+            ph('apiSecret', c.api_secret);
+            ph('dhanPin', c.pin);
+            ph('totpSecret', c.totp_secret);
+            stAlert('credentialsStatus', '', '');
         } else {
-            statusDiv.innerHTML = `<div class="warning-message">⚠️ No credentials configured</div>`;
-            listDiv.innerHTML = '<div style="color: var(--text-muted);">Please configure your Dhan API credentials</div>';
+            listDiv.innerHTML = '';
+            stAlert('credentialsStatus', 'warn',
+                '<strong>No credentials saved.</strong><small>Enter all five fields and save to enable automatic token generation.</small>');
         }
-    } catch (error) {
-        console.error('Error loading credentials status:', error);
-        const statusDiv = document.getElementById('credentialsStatus');
-        if (statusDiv) {
-            statusDiv.innerHTML = `<div class="error-message">❌ Error loading credentials status</div>`;
-        }
+    } catch (err) {
+        _stConn.credentials = false;
+        stAlert('credentialsStatus', 'err', `Could not load credentials: ${stEsc(err.message)}`);
     }
+    updateConnectionPill();
+}
+
+async function loadTokenStatus() {
+    const box = document.getElementById('st-token-state');
+    if (!box) return;
+    try {
+        const d = await stFetchJson(`${API_BASE}/api/settings/token/status`);
+        const last = d.last || {};
+        _stConn.token = !!d.has_token;
+        const methodNames = { renew: 'RenewToken', totp_ui: 'TOTP · saved', totp_env: 'TOTP · env' };
+        box.innerHTML = stKv([
+            ['Token', d.has_token ? 'Loaded' : 'Missing', d.has_token ? 'ok' : 'err'],
+            ['Last renewal', last.at ? stTime(last.at) : 'Not this session'],
+            ['Method', methodNames[last.method] || (last.action === 'failed' ? 'Failed' : '—'), last.action === 'failed' ? 'err' : ''],
+            ['Auto renewal', 'Daily 06:00 IST'],
+        ]);
+    } catch (err) {
+        _stConn.token = false;
+        box.innerHTML = '';
+        stAlert('token-status', 'err', `Could not load token status: ${stEsc(err.message)}`);
+    }
+    updateConnectionPill();
+}
+
+function getCredentialsFromForm() {
+    const val = id => (document.getElementById(id)?.value || '').trim();
+    const creds = {
+        client_id: val('clientId'),
+        api_key: val('apiKey'),
+        api_secret: val('apiSecret'),
+        pin: val('dhanPin'),
+        totp_secret: val('totpSecret'),
+    };
+    const labels = { client_id: 'Client ID', api_key: 'API key', api_secret: 'API secret', pin: 'PIN', totp_secret: 'TOTP secret' };
+    const missing = Object.keys(creds).filter(k => !creds[k]).map(k => labels[k]);
+    if (missing.length) {
+        stAlert('credentialsStatus', 'err', `Please fill in: <strong>${stEsc(missing.join(', '))}</strong>`);
+        return null;
+    }
+    if (!/^\d{6}$/.test(creds.pin)) {
+        stAlert('credentialsStatus', 'err', '<strong>PIN must be exactly 6 digits.</strong>');
+        return null;
+    }
+    return creds;
 }
 
 async function testCredentials() {
-    console.log('🔧 Test credentials function called');
-    
-    // First, test if elements exist
-    const button = document.getElementById('btn-test-credentials');
-    const statusDiv = document.getElementById('credentialsStatus');
-    
-    console.log('Button found:', !!button);
-    console.log('Status div found:', !!statusDiv);
-    
-    if (!button || !statusDiv) {
-        console.error('❌ Required elements not found');
-        alert('UI elements not found. Check console for details.');
-        return;
-    }
-    
-    // Test form data
     const credentials = getCredentialsFromForm();
-    if (!credentials) {
-        console.log('❌ No credentials provided');
-        return;
-    }
-    
-    console.log('✅ Credentials obtained from form');
-    
-    // Update UI
-    button.disabled = true;
-    button.textContent = 'Testing...';
-    statusDiv.innerHTML = '<div class="warning-message">🔄 Testing credentials...</div>';
-    
+    if (!credentials) return;
+    const restore = stBusy(document.getElementById('btn-test-credentials'), 'Testing…');
+    stAlert('credentialsStatus', 'info', 'Checking credential format and TOTP secret…');
     try {
-        console.log('📡 Sending test request...');
-        const response = await fetch('/api/settings/credentials/test', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(credentials)
+        const data = await stFetchJson(`${API_BASE}/api/settings/credentials/test`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(credentials),
         });
-        
-        console.log('📡 Response status:', response.status);
-        
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        const data = await response.json();
-        console.log('📡 Test response:', data);
-        
         if (data.success) {
-            statusDiv.innerHTML = `
-                <div class="success-message">
-                    ✅ <strong>Credentials Valid!</strong><br>
-                    🔐 <strong>TOTP Code:</strong> Generated successfully<br>
-                    <small>Generated at ${new Date().toLocaleTimeString()}</small>
-                </div>
-            `;
+            stAlert('credentialsStatus', 'ok',
+                '<strong>Looks good.</strong> The TOTP secret generates valid codes.<small>Save to use these credentials.</small>');
         } else {
-            statusDiv.innerHTML = `
-                <div class="error-message">
-                    ❌ <strong>Validation Failed</strong><br>
-                    ${data.message || 'Unknown error occurred'}
-                </div>
-            `;
+            stAlert('credentialsStatus', 'err', `<strong>Validation failed.</strong> ${stEsc(data.message || 'Unknown error')}`);
         }
-    } catch (error) {
-        console.error('❌ Test credentials error:', error);
-        statusDiv.innerHTML = `
-            <div class="error-message">
-                ❌ <strong>Connection Error</strong><br>
-                ${error.message}<br>
-                <small>Check console for details</small>
-            </div>
-        `;
+    } catch (err) {
+        stAlert('credentialsStatus', 'err', `Test failed: ${stEsc(err.message)}`);
     } finally {
-        button.disabled = false;
-        button.textContent = 'TEST';
-        console.log('🔧 Test function completed');
+        restore();
     }
 }
 
 async function saveCredentials() {
     const credentials = getCredentialsFromForm();
     if (!credentials) return;
-    
-    const button = document.getElementById('btn-save-credentials');
-    const statusDiv = document.getElementById('credentialsStatus');
-    
-    button.disabled = true;
-    button.textContent = 'Saving...';
-    statusDiv.innerHTML = '<div class="warning-message">🔄 Saving credentials...</div>';
-    
+    const restore = stBusy(document.getElementById('btn-save-credentials'), 'Saving…');
     try {
-        const response = await fetch('/api/settings/credentials/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(credentials)
+        const data = await stFetchJson(`${API_BASE}/api/settings/credentials/save`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(credentials),
         });
-        
-        const data = await response.json();
-        
         if (data.success) {
-            statusDiv.innerHTML = `
-                <div class="success-message">
-                    ✅ ${data.message}
-                </div>
-            `;
-            // Reload status to show updated info
-            setTimeout(() => loadCredentialsStatus(), 1000);
+            ['apiSecret', 'dhanPin', 'totpSecret'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+            await loadCredentialsStatus();
+            stAlert('credentialsStatus', 'ok', `<strong>Saved.</strong> ${stEsc(data.message || '')}`);
         } else {
-            statusDiv.innerHTML = `
-                <div class="error-message">
-                    ❌ ${data.message}
-                </div>
-            `;
+            stAlert('credentialsStatus', 'err', stEsc(data.message || 'Save failed'));
         }
-    } catch (error) {
-        statusDiv.innerHTML = `
-            <div class="error-message">
-                ❌ Error saving credentials: ${error.message}
-            </div>
-        `;
+    } catch (err) {
+        stAlert('credentialsStatus', 'err', `Save failed: ${stEsc(err.message)}`);
     } finally {
-        button.disabled = false;
-        button.textContent = 'Save';
+        restore();
     }
 }
 
 async function clearCredentials() {
-    if (!confirm('Are you sure you want to clear all credentials? This cannot be undone.')) {
-        return;
-    }
-    
-    const button = document.getElementById('btn-clear-credentials');
-    const statusDiv = document.getElementById('credentialsStatus');
-    
-    button.disabled = true;
-    button.textContent = 'Clearing...';
-    
+    if (!confirm('Delete the saved Dhan credentials and access token from this machine?\n\nAutomatic token renewal stops until you save them again.')) return;
+    const restore = stBusy(document.getElementById('btn-clear-credentials'), 'Clearing…');
     try {
-        const response = await fetch('/api/settings/credentials/clear', {
-            method: 'POST'
-        });
-        
-        const data = await response.json();
-        
+        const data = await stFetchJson(`${API_BASE}/api/settings/credentials/clear`, { method: 'POST' });
         if (data.success) {
-            statusDiv.innerHTML = `<div class="success-message">✅ ${data.message}</div>`;
-            
-            // Clear form
-            document.getElementById('clientId').value = '';
-            document.getElementById('apiKey').value = '';
-            document.getElementById('apiSecret').value = '';
-            document.getElementById('dhanPin').value = '';
-            document.getElementById('totpSecret').value = '';
-            
-            // Reload status
-            setTimeout(() => loadCredentialsStatus(), 1000);
+            ['clientId', 'apiKey', 'apiSecret', 'dhanPin', 'totpSecret'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) { el.value = ''; if (el.dataset.ph) el.placeholder = el.dataset.ph; }
+            });
+            await loadCredentialsStatus();
+            await loadTokenStatus();
         } else {
-            statusDiv.innerHTML = `<div class="error-message">❌ ${data.message}</div>`;
+            stAlert('credentialsStatus', 'err', stEsc(data.message || 'Clear failed'));
         }
-    } catch (error) {
-        statusDiv.innerHTML = `<div class="error-message">❌ Error: ${error.message}</div>`;
+    } catch (err) {
+        stAlert('credentialsStatus', 'err', `Clear failed: ${stEsc(err.message)}`);
     } finally {
-        button.disabled = false;
-        button.textContent = 'Clear';
+        restore();
     }
 }
 
-function getCredentialsFromForm() {
-    console.log('🔍 Getting credentials from form...');
-    
-    const clientIdEl = document.getElementById('clientId');
-    const apiKeyEl = document.getElementById('apiKey');
-    const apiSecretEl = document.getElementById('apiSecret');
-    const pinEl = document.getElementById('dhanPin');
-    const totpSecretEl = document.getElementById('totpSecret');
-    const statusDiv = document.getElementById('credentialsStatus');
-    
-    // Check if elements exist
-    const elements = { clientIdEl, apiKeyEl, apiSecretEl, pinEl, totpSecretEl };
-    const missingElements = Object.entries(elements).filter(([key, el]) => !el).map(([key]) => key);
-    
-    if (missingElements.length > 0) {
-        console.error('❌ Form elements not found:', missingElements);
-        if (statusDiv) {
-            statusDiv.innerHTML = `<div class="error-message">❌ Form elements not found: ${missingElements.join(', ')}</div>`;
+async function _runTokenAction(btnId, busyLabel, url) {
+    const restore = stBusy(document.getElementById(btnId), busyLabel);
+    stAlert('token-status', 'info', 'Contacting Dhan…');
+    try {
+        const data = await stFetchJson(url, { method: 'POST' });
+        if (data.success) {
+            stAlert('token-status', 'ok', `<strong>${stEsc(data.message || 'Done')}</strong><small>${stEsc(new Date().toLocaleTimeString())}</small>`);
+        } else {
+            stAlert('token-status', 'err', `<strong>Failed.</strong> ${stEsc(data.message || 'See server logs')}`);
         }
-        return null;
+    } catch (err) {
+        stAlert('token-status', 'err', `Request failed: ${stEsc(err.message)}`);
+    } finally {
+        restore();
+        loadTokenStatus();
     }
-    
-    // Get values
-    const clientId = clientIdEl.value.trim();
-    const apiKey = apiKeyEl.value.trim();
-    const apiSecret = apiSecretEl.value.trim();
-    const pin = pinEl.value.trim();
-    const totpSecret = totpSecretEl.value.trim();
-    
-    console.log('📋 Form values:', { 
-        clientId: clientId || '(empty)', 
-        apiKey: apiKey || '(empty)', 
-        apiSecret: apiSecret ? '***' : '(empty)', 
-        pin: pin ? '***' : '(empty)', 
-        totpSecret: totpSecret ? '***' : '(empty)' 
-    });
-    
-    // Validate required fields
-    const emptyFields = [];
-    if (!clientId) emptyFields.push('Client ID');
-    if (!apiKey) emptyFields.push('API Key');
-    if (!apiSecret) emptyFields.push('API Secret');
-    if (!pin) emptyFields.push('PIN');
-    if (!totpSecret) emptyFields.push('TOTP Secret');
-    
-    if (emptyFields.length > 0) {
-        if (statusDiv) {
-            statusDiv.innerHTML = `<div class="error-message">❌ Please fill in: <strong>${emptyFields.join(', ')}</strong></div>`;
-        }
-        return null;
-    }
-    
-    // Validate PIN format
-    if (pin.length !== 6 || !/^\d+$/.test(pin)) {
-        if (statusDiv) {
-            statusDiv.innerHTML = '<div class="error-message">❌ <strong>PIN must be exactly 6 digits</strong></div>';
-        }
-        return null;
-    }
-    
-    console.log('✅ Form validation passed');
-    
-    return {
-        client_id: clientId,
-        api_key: apiKey,
-        api_secret: apiSecret,
-        pin: pin,
-        totp_secret: totpSecret
-    };
 }
 
-async function generateTokenNow() {
-    console.log('🔧 Generate token now function called');
-    
-    const button = document.getElementById('btn-generate-token');
-    const statusDiv = document.getElementById('token-status');
-    
-    if (!button || !statusDiv) {
-        console.error('❌ Required elements not found');
-        return;
-    }
-    
-    button.disabled = true;
-    button.textContent = 'Generating...';
-    statusDiv.innerHTML = '<div style="color: #f59e0b;">🔄 Generating token using UI credentials...</div>';
-    
-    try {
-        console.log('📡 Sending generate token request...');
-        const response = await fetch('/api/settings/credentials/generate-token', {
-            method: 'POST'
-        });
-        
-        console.log('📡 Response status:', response.status);
-        
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        const data = await response.json();
-        console.log('📡 Generate token response:', data);
-        
-        if (data.success) {
-            statusDiv.innerHTML = `
-                <div style="color: #10b981; font-weight: 600;">
-                    ✅ <strong>Token Generated!</strong><br>
-                    <small>Generated at ${new Date().toLocaleTimeString()}</small>
-                </div>
-            `;
-        } else {
-            statusDiv.innerHTML = `
-                <div style="color: #ef4444; font-weight: 600;">
-                    ❌ <strong>Generation Failed</strong><br>
-                    ${data.message}
-                </div>
-            `;
-        }
-    } catch (error) {
-        console.error('❌ Generate token error:', error);
-        statusDiv.innerHTML = `
-            <div style="color: #ef4444; font-weight: 600;">
-                ❌ <strong>Connection Error</strong><br>
-                ${error.message}
-            </div>
-        `;
-    } finally {
-        button.disabled = false;
-        button.textContent = 'Generate Token';
-        console.log('🔧 Generate token function completed');
-    }
+function generateTokenNow() {
+    return _runTokenAction('btn-generate-token', 'Generating…', `${API_BASE}/api/settings/credentials/generate-token`);
+}
+
+function refreshDhanToken() {
+    return _runTokenAction('btn-refresh-token', 'Renewing…', `${API_BASE}/api/settings/token/refresh`);
 }

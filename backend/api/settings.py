@@ -798,6 +798,18 @@ async def disable_pnl_exit():
         await client.close()
 
 
+@router.get("/token/status")
+def dhan_token_status():
+    """Whether an access token is loaded and how the last renewal went (never the token)."""
+    from backend.services.token_manager import current_token, last_result
+
+    last = last_result()
+    return {
+        "has_token": bool(current_token()),
+        "last": {k: last.get(k) for k in ("success", "action", "method", "at")},
+    }
+
+
 @router.post("/token/refresh")
 async def refresh_dhan_token():
     """Manually renew the Dhan access token (RenewToken, then TOTP fallback)."""

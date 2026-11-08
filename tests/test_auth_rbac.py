@@ -87,6 +87,17 @@ def test_admin_token_routes_return_no_token(app_db):
         assert "token_preview" not in r.json() and "new_token" not in r.json()
 
 
+def test_token_status_reports_state_without_token(app_db, monkeypatch):
+    monkeypatch.setenv("DHAN_ACCESS_TOKEN", "TOK-SECRET-VALUE")
+    monkeypatch.setattr(tm, "_last_result", {"success": True, "action": "renewed", "method": "renew",
+                                              "at": "2026-11-08T06:00:00+05:30", "message": "x"})
+    r = login("adm", "pw-a").get("/api/settings/token/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["has_token"] is True and body["last"]["method"] == "renew"
+    assert "TOK-SECRET-VALUE" not in r.text and "message" not in body["last"]
+
+
 def test_login_throttled_after_repeated_failures(app_db):
     c = TestClient(appmod.app)
     for _ in range(5):

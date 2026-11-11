@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from backend.config import get_config
 from backend.models.tables import Signal, SignalHistory, Instrument
 from backend.services.dhan_client import DhanClient
-from backend.services.sector_mapping import get_sectors_for_stock
+from backend.services.sector_mapping import get_sectors_for_stock, sectors_for_instrument
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +82,7 @@ class FnoScanner:
         pe_sector_insts: dict[str, list[Instrument]] = {}
 
         for inst in instruments:
-            sym = inst.trading_symbol or inst.symbol
-            stock_sectors = get_sectors_for_stock(sym)
+            stock_sectors = sectors_for_instrument(inst)
             for sec in stock_sectors:
                 if sec in ce_sectors:
                     ce_sector_insts.setdefault(sec, []).append(inst)

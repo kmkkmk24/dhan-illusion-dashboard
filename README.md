@@ -163,6 +163,27 @@ uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
 pytest
 ```
 
+### Database migrations (Alembic)
+
+The SQLite schema (`data/trades.db`) is managed by Alembic. Migrations live in
+`backend/migrations/versions/`, and the app applies any pending ones at startup.
+A database created before Alembic was adopted is detected, brought up to the
+`0001` baseline without touching its data, and marked at that revision.
+
+When you change a model in `backend/models/tables.py`:
+
+```bash
+# 1. Generate a migration from the model change, then read it over
+alembic revision --autogenerate -m "add target_3 to trades"
+
+# 2. Apply it (or just restart the app)
+alembic upgrade head
+```
+
+`pytest` fails (`test_models_match_migrations`) if a model changes without a migration.
+SQLite can't alter most column properties in place, so migrations use Alembic's
+batch mode (rebuild the table). Take a backup from Settings before a big change.
+
 ## 📈 Production Deployment
 
 ### Environment Setup

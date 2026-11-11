@@ -67,6 +67,10 @@
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 16l4-8 4 4 4-6"/></svg>
                 <span>Sectors</span>
             </div>
+            <div onclick="switchTab('ipos')" id="tab-ipos" class="nav-item">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 4.9 5.4.8-3.9 3.8.9 5.4L12 14.4 7.2 16.9l.9-5.4L4.2 7.7l5.4-.8z"/><path d="M5 21h14"/></svg>
+                <span>IPOs</span>
+            </div>
             <div onclick="switchTab('market-direction')" id="tab-market-direction" class="nav-item">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M3 3v18h18"/><path d="M6 14l4-4 3 2 5-6"/><circle cx="18" cy="6" r="1.5"/>
@@ -137,36 +141,265 @@
     <main class="flex-1 overflow-hidden flex flex-col min-h-0" style="padding:12px 16px">
 
         <!-- Sector Analysis Tab -->
-        <section id="content-sectors" class="tab-content flex flex-col flex-1 overflow-hidden">
-            <div class="flex items-center justify-between mb-2 flex-shrink-0">
-                <h2 class="text-sm font-bold" style="color:var(--text-heading)">Sector Analysis</h2>
-                <div class="flex items-center gap-2">
-                    <span id="sector-tab-status" class="text-2xs" style="color:var(--text-muted)"></span>
-                    <button onclick="toggleSectorTelegramOnRefresh()" id="btn-sector-telegram"
-                        class="btn-secondary px-2 py-1 rounded-lg text-2xs" title="Send Telegram after refresh">T</button>
-                    <button onclick="runSectorAnalysisFromTab()" id="btn-refresh-sectors"
-                        class="btn-primary px-3 py-1 rounded-lg text-2xs">Refresh Sectors</button>
-                </div>
+        <section id="content-sectors" class="tab-content flex flex-col flex-1 overflow-auto min-h-0">
+            <div class="sx-bg" aria-hidden="true">
+                <span class="sx-orb sx-orb--a"></span>
+                <span class="sx-orb sx-orb--b"></span>
+                <span class="sx-orb sx-orb--c"></span>
             </div>
-            <div class="flex gap-3 flex-1 overflow-hidden">
-                <div id="sectors-table-wrap" class="w-1/2 flex-shrink-0 overflow-auto">
-                    <div id="sectors-table" class="glass-card overflow-hidden">
-                        <div class="p-10 text-center" style="color:var(--text-muted)">
-                            <p class="text-sm mb-1">No sector data yet</p>
-                            <p class="text-xs" style="color:var(--text-muted)">Click "Refresh Sectors" to run analysis.</p>
+
+            <div class="sx-page">
+                <header class="sx-hero sx-reveal" style="--d:0">
+                    <div>
+                        <p class="sx-eyebrow">Sector rotation</p>
+                        <h2 class="sx-title">Where the money is moving.</h2>
+                        <p class="sx-sub" id="sx-asof">Relative strength of every Nifty sector against Nifty 50.</p>
+                    </div>
+                    <div class="sx-hero-actions">
+                        <span id="sector-tab-status" class="sx-status" aria-live="polite"></span>
+                        <button type="button" id="btn-sector-telegram" class="sx-switch" role="switch" aria-checked="false"
+                            onclick="toggleSectorTelegramOnRefresh()" title="Send the sector report to Telegram after each refresh">
+                            <span class="sx-switch-track"><span class="sx-switch-thumb"></span></span>
+                            Telegram
+                        </button>
+                        <button type="button" id="btn-sx-guide" class="sx-btn" onclick="sxOpenGuide()">
+                            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6"/><path d="M12 17h.01"/></svg>
+                            How to read
+                        </button>
+                        <button type="button" id="btn-refresh-sectors" class="sx-btn sx-btn--primary" onclick="runSectorAnalysisFromTab()">
+                            <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+                            Refresh
+                        </button>
+                    </div>
+                </header>
+
+                <div id="sx-kpis" class="sx-kpis sx-reveal" style="--d:1"></div>
+
+                <article class="sx-card sx-reveal" style="--d:2">
+                    <div class="sx-card-head">
+                        <div>
+                            <h3>Confirmed on Daily &amp; Weekly <button type="button" class="sx-info" data-help="agree" aria-label="About confirmed on daily and weekly" aria-expanded="false" aria-controls="sx-pop">i</button></h3>
+                            <p>Sectors in the same quadrant on both timeframes, a firmer reading than either one alone</p>
+                        </div>
+                        <span id="sx-agree-summary" class="sx-agree-summary"></span>
+                    </div>
+                    <div id="sx-agree"></div>
+                </article>
+
+                <div class="sx-grid">
+                    <article class="sx-card sx-reveal" style="--d:3">
+                        <div class="sx-card-head">
+                            <div>
+                                <h3>Rotation map <button type="button" class="sx-info" data-help="map" aria-label="About rotation map" aria-expanded="false" aria-controls="sx-pop">i</button></h3>
+                                <p>RS-Ratio (trend) vs RS-Momentum (acceleration) · tails show the recent path</p>
+                            </div>
+                            <div class="sx-seg" id="sx-tf" role="tablist">
+                                <span class="sx-seg-ink"></span>
+                                <button type="button" data-tf="daily" class="active" onclick="setRotationTimeframe('daily')">Daily</button>
+                                <button type="button" data-tf="weekly" onclick="setRotationTimeframe('weekly')">Weekly</button>
+                            </div>
+                        </div>
+                        <div class="sx-rrg-wrap" id="sx-rrg-wrap">
+                            <svg id="sx-rrg" role="img" aria-label="Relative rotation graph of Nifty sectors"></svg>
+                            <div id="sx-rrg-tip" class="sx-tip"></div>
+                        </div>
+                        <div class="sx-legend">
+                            <span>Sectors usually rotate clockwise: Improving → Leading → Weakening → Lagging</span>
+                        </div>
+                    </article>
+
+                    <article class="sx-card sx-flow-card sx-reveal" style="--d:4">
+                        <div class="sx-card-head">
+                            <div>
+                                <h3>Money flow <button type="button" class="sx-info" data-help="flow" aria-label="About money flow" aria-expanded="false" aria-controls="sx-pop">i</button></h3>
+                                <p>Where relative strength rotated on the latest bar</p>
+                            </div>
+                        </div>
+                        <div id="sx-flow" class="sx-flow"></div>
+                    </article>
+                </div>
+
+                <article class="sx-card sx-reveal" style="--d:5">
+                    <div class="sx-card-head">
+                        <div>
+                            <h3>Performance heatmap <button type="button" class="sx-info" data-help="heat" aria-label="About performance heatmap" aria-expanded="false" aria-controls="sx-pop">i</button></h3>
+                            <p>Absolute returns of each sector index · sorted by 1-month return</p>
                         </div>
                     </div>
-                </div>
-                <div id="sector-stocks-panel" class="w-1/2 flex-shrink-0 hidden overflow-hidden flex flex-col">
-                    <div class="flex items-center justify-between mb-1 flex-shrink-0">
-                        <h3 id="sector-stocks-title" class="text-xs font-semibold" style="color:var(--text-heading)"></h3>
-                        <button onclick="closeSectorStocks()" class="text-2xs" style="color:var(--text-muted);cursor:pointer">Close</button>
+                    <div id="sx-heat" class="sx-heat"></div>
+                </article>
+
+                <article class="sx-card sx-reveal" style="--d:6">
+                    <div class="sx-card-head">
+                        <div>
+                            <h3>Momentum leaderboard <button type="button" class="sx-info" data-help="board" aria-label="About momentum leaderboard" aria-expanded="false" aria-controls="sx-pop">i</button></h3>
+                            <p>Multi-timeframe relative strength + price action · click a sector for details</p>
+                        </div>
                     </div>
-                    <div class="glass-card-sm p-1.5 mb-1 flex-shrink-0" style="height:220px">
-                        <canvas id="sector-chart"></canvas>
+                    <div id="sectors-table" class="sx-board"></div>
+                </article>
+            </div>
+
+            <div id="sx-scrim" class="sx-scrim" onclick="closeSectorStocks()"></div>
+            <aside id="sector-stocks-panel" class="sx-drawer" aria-hidden="true" aria-labelledby="sector-stocks-title">
+                <div class="sx-drawer-head">
+                    <div>
+                        <h3 id="sector-stocks-title"></h3>
+                        <div class="sx-sub" id="sx-drawer-tags"></div>
                     </div>
-                    <div id="sector-stocks-list" class="glass-card-sm overflow-auto flex-1"></div>
+                    <div class="sx-drawer-actions">
+                        <button type="button" id="btn-sx-open-dhan" class="sx-btn sx-btn--sm" onclick="sxOpenInDhan()" title="Open TradingView on Dhan in a new tab">
+                            Open in Dhan
+                            <svg viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg>
+                        </button>
+                        <button type="button" class="sx-close" onclick="closeSectorStocks()" aria-label="Close">
+                            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                        </button>
+                    </div>
                 </div>
+                <div id="sx-drawer-msg" class="sx-drawer-msg" aria-live="polite" hidden></div>
+                <div id="sx-drawer-stats" class="sx-stats"></div>
+                <div class="sx-chart sx-chart--link" role="button" tabindex="0" onclick="sxOpenInDhan()"
+                    onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();sxOpenInDhan();}"
+                    aria-label="Open TradingView on Dhan in a new tab">
+                    <canvas id="sector-chart"></canvas>
+                    <span class="sx-chart-hint">Open in Dhan ↗</span>
+                </div>
+                <div id="sector-stocks-list" class="sx-stocks"></div>
+
+            </aside>
+
+            <!-- Info popover (shared by all ⓘ buttons) -->
+            <div id="sx-pop" class="sx-pop" role="dialog" aria-label="Panel help" hidden></div>
+
+            <!-- Full "How to read" guide -->
+            <div id="sx-guide-scrim" class="sx-scrim sx-guide-scrim" onclick="sxCloseGuide()"></div>
+            <div id="sx-guide" class="sx-guide" role="dialog" aria-modal="true" aria-labelledby="sx-guide-title" hidden>
+                <div class="sx-guide-head">
+                    <div>
+                        <p class="sx-eyebrow">Guide</p>
+                        <h3 id="sx-guide-title">How to read the Sectors tab</h3>
+                    </div>
+                    <button type="button" class="sx-close" onclick="sxCloseGuide()" aria-label="Close guide">
+                        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                    </button>
+                </div>
+                <div class="sx-guide-body">
+                    <section>
+                        <h4>What this tab tells you</h4>
+                        <p>Which Nifty sectors are gaining strength compared with the overall market, which are losing it, and how that is <b>changing</b>. Every measure compares a sector index with <b>Nifty 50</b>, so "strong" always means "stronger than the market".</p>
+                    </section>
+
+                    <section>
+                        <h4>1 · Two measurements</h4>
+                        <div class="sx-guide-pair">
+                            <div><b>RS-Ratio</b><span>Is the sector beating Nifty 50? Above 100 = yes, below = no. Further from 100 = by more.</span></div>
+                            <div><b>RS-Momentum</b><span>Is that getting better or worse? Above 100 = relative strength improving, below = fading.</span></div>
+                        </div>
+                    </section>
+
+                    <section>
+                        <h4>2 · Four quadrants and the cycle</h4>
+                        <div class="sx-cycle" aria-hidden="true">
+                            <span class="sx-cycle-q" data-q="Improving"><b>Improving</b><small>behind · catching up</small></span>
+                            <span class="sx-cycle-arrow">→</span>
+                            <span class="sx-cycle-q" data-q="Leading"><b>Leading</b><small>ahead · gaining</small></span>
+                            <span class="sx-cycle-arrow">↑</span>
+                            <span class="sx-cycle-center">Nifty 50<br>= 100</span>
+                            <span class="sx-cycle-arrow">↓</span>
+                            <span class="sx-cycle-q" data-q="Lagging"><b>Lagging</b><small>behind · falling back</small></span>
+                            <span class="sx-cycle-arrow">←</span>
+                            <span class="sx-cycle-q" data-q="Weakening"><b>Weakening</b><small>ahead · fading</small></span>
+                        </div>
+                        <p>Sectors usually travel <b>clockwise</b>: Improving → Leading → Weakening → Lagging → Improving. That is the "rotation". It is a tendency, not a rule: a sector can turn back, e.g. from Improving straight back to Lagging.</p>
+                    </section>
+
+                    <section>
+                        <h4>3 · The panels</h4>
+                        <dl class="sx-guide-list">
+                            <dt>Quadrant tiles</dt>
+                            <dd>How many sectors sit in each quadrant right now, and which ones. Many sectors in <b>Improving</b> means strength is broadening; leaders sliding into <b>Weakening</b> is the first warning that leadership is changing.</dd>
+                            <dt>Confirmed on Daily &amp; Weekly</dt>
+                            <dd>Sectors in the <b>same quadrant on both</b> timeframes: the Daily-vs-Weekly cross-check done for you. Sectors where the two disagree are listed under <b>mixed readings</b>.</dd>
+                            <dt>Rotation map</dt>
+                            <dd>The same quadrants as a picture. Each dot is a sector's latest position; its tail shows where it came from. Look at <b>where</b> a dot is (which quadrant, how far from the centre) and <b>where it is heading</b> (direction of the tail).</dd>
+                            <dt>Money flow</dt>
+                            <dd>The biggest movers on the latest bar: sectors rotating <b>in</b> (relative strength rising) and <b>out</b> (falling), including quadrant changes such as "Lagging → Improving". This is where new rotations show up first.</dd>
+                            <dt>Performance heatmap</dt>
+                            <dd>Plain returns over 1 day, 1 week, 1 month and 3 months. Use it to check the <b>absolute</b> move behind a relative reading.</dd>
+                            <dt>Momentum leaderboard</dt>
+                            <dd>A 0–100 score per sector (50% relative strength across hourly/daily/weekly/monthly + 50% price action such as EMAs and higher highs). The score says how strong a sector is <b>now</b>; the map says whether that is <b>improving or fading</b>.</dd>
+                            <dt>Detail panel</dt>
+                            <dd>Click any sector anywhere to see its score, recent returns, weekly chart and the stocks in it, including any active scanner signals.</dd>
+                        </dl>
+                    </section>
+
+                    <section>
+                        <h4>4 · A simple way to use it</h4>
+                        <ol class="sx-guide-steps">
+                            <li><b>Start with what's confirmed.</b> The <b>Confirmed on Daily &amp; Weekly</b> panel lists sectors whose short- and longer-term readings agree. Leading or Improving on both are the firmest strength readings.</li>
+                            <li><b>See where they're heading.</b> On the map, switch between Weekly (bigger trend) and Daily (timing) to see each sector's direction. Treat mixed readings with more caution.</li>
+                            <li><b>What's changing: Money flow.</b> Note sectors rotating in, and any quadrant changes on the latest bar.</li>
+                            <li><b>Reality check: Heatmap.</b> Confirm the actual returns. Relative strength in a falling market can still mean falling prices.</li>
+                            <li><b>Drill down: Leaderboard and detail panel.</b> Open the sectors you shortlisted, check the score and chart, and look at their stocks and signals.</li>
+                        </ol>
+                    </section>
+
+                    <section>
+                        <h4>5 · Keep in mind</h4>
+                        <ul class="sx-guide-notes">
+                            <li><b>Relative, not absolute.</b> "Leading" means outperforming Nifty, not necessarily rising.</li>
+                            <li><b>Near the lines is noisy.</b> A dot close to 100 on either axis can switch quadrant on a small move; check the map, not just the tile.</li>
+                            <li><b>"Money flow" is relative strength.</b> Index data has no volume, so it shows performance rotating between sectors, not traded money.</li>
+                            <li><b>Readings describe the market; they are not trade signals.</b> Use them to decide where to look, then judge individual stocks on their own setups.</li>
+                            <li><b>Freshness.</b> Data updates when you press <b>Refresh</b> (and on the scheduled daily sector report). The date under the title shows which session it covers.</li>
+                        </ul>
+                    </section>
+                </div>
+            </div>
+        </section>
+
+        <!-- IPOs Tab -->
+        <section id="content-ipos" class="tab-content hidden flex flex-col flex-1 overflow-auto min-h-0">
+            <div class="sx-bg" aria-hidden="true">
+                <span class="sx-orb sx-orb--a"></span>
+                <span class="sx-orb sx-orb--b"></span>
+                <span class="sx-orb sx-orb--c"></span>
+            </div>
+            <div class="sx-page">
+                <header class="sx-hero sx-reveal" style="--d:0">
+                    <div>
+                        <p class="sx-eyebrow">IPO tracker</p>
+                        <h2 class="sx-title">New listings near their highs.</h2>
+                        <p class="sx-sub" id="ipo-asof">Main-board IPOs listed on NSE since Nov 2021, measured against their all-time high. New listings are added on every refresh.</p>
+                    </div>
+                    <div class="sx-hero-actions">
+                        <span id="ipo-status" class="sx-status" aria-live="polite"></span>
+                        <button type="button" id="btn-ipo-refresh" class="sx-btn sx-btn--primary" onclick="ipoRefresh()">
+                            <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+                            Refresh
+                        </button>
+                    </div>
+                </header>
+
+                <div id="ipo-years" class="ipo-years sx-reveal" style="--d:1"></div>
+
+                <article class="sx-card sx-reveal" style="--d:2">
+                    <div class="ipo-toolbar">
+                        <div class="sx-seg" id="ipo-band" role="tablist" aria-label="Distance from all-time high">
+                            <span class="sx-seg-ink"></span>
+                            <button type="button" data-band="all" class="active" onclick="ipoSetBand('all')">All</button>
+                            <button type="button" data-band="at_ath" onclick="ipoSetBand('at_ath')">At ATH</button>
+                            <button type="button" data-band="near" onclick="ipoSetBand('near')">&lt;15% below ATH</button>
+                        </div>
+                        <label class="ipo-check"><input type="checkbox" id="ipo-fno" onchange="ipoRender()"> F&amp;O only</label>
+                        <input type="search" id="ipo-search" class="ipo-search" placeholder="Search stock or company" oninput="ipoRender()">
+                        <span id="ipo-count" class="ipo-count"></span>
+                    </div>
+                    <div id="ipo-table" class="ipo-table"></div>
+                    <p class="ipo-foot">At ATH = close within 2% of the highest price since listing. &lt;15% below ATH includes At ATH.
+                        ATH uses daily highs from Dhan since the listing day. Click a row to open TradingView on Dhan (the symbol is copied).</p>
+                </article>
             </div>
         </section>
 

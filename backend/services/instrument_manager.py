@@ -69,6 +69,9 @@ async def refresh_instruments(db: Session) -> dict:
         if pd.notna(usid) and pd.notna(usym):
             fno_trading_symbols[str(int(usid))] = str(usym)
 
+    # F&O lot size per underlying security id, from stock futures (nearest live expiry).
+    fno_lots = _fno_lot_sizes(fno_df)
+
     logger.info(f"Found {len(equity_df)} NSE equity instruments, {len(fno_symbols)} F&O symbols")
 
     added = 0
@@ -82,11 +85,20 @@ async def refresh_instruments(db: Session) -> dict:
         symbol = str(row.get("SYMBOL_NAME", row.get("SM_SYMBOL_NAME", "")))
         display_name = str(row.get("DISPLAY_NAME", row.get("SEM_CUSTOM_SYMBOL", symbol)))
         instrument_type = str(row.get("INSTRUMENT_TYPE", row.get("SEM_EXCH_INSTRUMENT_TYPE", "")))
-        lot_size_raw = row.get("LOT_SIZE", row.get("SEM_LOT_UNITS", 1))
-        lot_size = int(lot_size_raw) if lot_size_raw and str(lot_size_raw).isdigit() else 1
+        # F&O stocks use the futures lot size; cash-only stocks keep 1.
+        # (Set here in the same pass: a separate post-step looked rows up by
+        # trading_symbol before new rows were flushed, so a first refresh left
+        # every F&O lot at 1.)
+        lot_size = fno_lots.get(security_id, 1)
         isin = str(row.get("ISIN", ""))
-        trading_symbol = fno_trading_symbols.get(security_id)
-        is_fno = trading_symbol is not None
+        is_fno = security_id in fno_trading_symbols
+        # NSE ticker for every equity (Dhan's UNDERLYING_SYMBOL), not only F&O stocks;
+        # sector lookups and displays key on this, and non-F&O stocks used to fall
+        # back to Dhan's company-style SYMBOL_NAME and never matched a sector.
+        ticker = row.get("UNDERLYING_SYMBOL")
+        trading_symbol = fno_trading_symbols.get(security_id) or (
+            str(ticker).strip() if pd.notna(ticker) and str(ticker).strip() else None
+        )
 
         existing = db.query(Instrument).filter(Instrument.security_id == security_id).first()
 
@@ -117,9 +129,6 @@ async def refresh_instruments(db: Session) -> dict:
             db.add(instrument)
             added += 1
 
-    # Also store F&O lot sizes from the derivatives data
-    _update_fno_lot_sizes(db, fno_df)
-
     db.commit()
 
     summary = {
@@ -132,41 +141,35 @@ async def refresh_instruments(db: Session) -> dict:
     return summary
 
 
-def _update_fno_lot_sizes(db: Session, fno_df) -> None:
-    """Update lot sizes for F&O stocks from the derivatives segment data."""
-    futures_df = fno_df[
-        fno_df["INSTRUMENT"].isin(["FUTSTK", "FUTIDX"])
-    ].drop_duplicates(subset=["UNDERLYING_SYMBOL"], keep="first")
+def _fno_lot_sizes(fno_df: pd.DataFrame) -> dict[str, int]:
+    """
+    Map underlying (cash) security id -> current F&O lot size.
 
-    updated = 0
-    for _, row in futures_df.iterrows():
-        underlying = str(row.get("UNDERLYING_SYMBOL", ""))
-        lot_size_raw = row.get("LOT_SIZE", None)
-        if not underlying or pd.isna(lot_size_raw):
+    Uses stock futures; when NSE revises a lot size, contracts of different
+    expiries carry different lots, so the nearest live expiry wins.
+    """
+    fut = fno_df[fno_df["INSTRUMENT"] == "FUTSTK"].copy()
+    if fut.empty:
+        return {}
+    fut["_exp"] = pd.to_datetime(fut.get("SM_EXPIRY_DATE"), errors="coerce")
+    today = pd.Timestamp(datetime.now().date())
+    live = fut[fut["_exp"] >= today]
+    fut = (live if not live.empty else fut).sort_values("_exp")
+    lots: dict[str, int] = {}
+    for _, row in fut.iterrows():
+        usid, lot = row.get("UNDERLYING_SECURITY_ID"), row.get("LOT_SIZE")
+        if pd.isna(usid) or pd.isna(lot):
             continue
-
+        key = str(int(usid))
+        if key in lots:
+            continue  # keep the nearest expiry
         try:
-            lot_size = int(float(lot_size_raw))
-        except (ValueError, TypeError):
+            value = int(float(lot))
+        except (TypeError, ValueError):
             continue
-
-        if lot_size <= 0:
-            continue
-
-        instrument = (
-            db.query(Instrument)
-            .filter(
-                Instrument.exchange == "NSE",
-                func.upper(Instrument.trading_symbol) == underlying.strip().upper(),
-            )
-            .first()
-        )
-
-        if instrument:
-            instrument.lot_size = lot_size
-            updated += 1
-
-    logger.info(f"Updated lot sizes for {updated} F&O instruments")
+        if value > 0:
+            lots[key] = value
+    return lots
 
 
 def get_fno_stocks(db: Session) -> list[Instrument]:

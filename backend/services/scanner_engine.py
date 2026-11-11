@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from backend.config import get_config
 from backend.models.tables import Signal, SignalHistory, Instrument
 from backend.services.dhan_client import DhanClient
-from backend.services.sector_mapping import get_sectors_for_stock
+from backend.services.sector_mapping import sectors_for_instrument
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +312,7 @@ class ScannerEngine:
             display_sym = instrument.trading_symbol or instrument.symbol
             sector = instrument.sector
             if not sector:
-                sectors = get_sectors_for_stock(display_sym)
+                sectors = sectors_for_instrument(instrument)
                 sector = sectors[0] if sectors else "Other"
 
             signal = Signal(
@@ -345,7 +345,7 @@ class ScannerEngine:
 
             if not signal.sector:
                 display_sym = instrument.trading_symbol or instrument.symbol
-                sectors = get_sectors_for_stock(display_sym)
+                sectors = sectors_for_instrument(instrument)
                 signal.sector = sectors[0] if sectors else "Other"
 
             if result["is_explosion"]:

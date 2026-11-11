@@ -26,9 +26,17 @@ logger = logging.getLogger(__name__)
 @router.post("/instruments/refresh")
 async def refresh_instruments(db: Session = Depends(get_db)):
     """Download latest instrument master from Dhan and refresh the database."""
+    from backend.services.index_constituents import refresh_constituents
+
     summary = await instrument_manager.refresh_instruments(db)
+    constituents = await refresh_constituents()  # keeps previous lists for any index that fails
     sectors_updated = update_instrument_sectors(db)
-    return {"message": "Instruments refreshed", "sectors_mapped": sectors_updated, **summary}
+    return {
+        "message": "Instruments refreshed",
+        "sectors_mapped": sectors_updated,
+        "constituents": constituents,
+        **summary,
+    }
 
 
 @router.get("/instruments/search")
@@ -537,8 +545,9 @@ async def get_all_sectors(db: Session = Depends(get_db)):
     if _has_fresh_sector_cache():
         return _sector_analysis_cache
 
-    # Fallback to DB data if no cached results
+    # Fallback to DB data if no cached results (e.g. after a restart)
     from backend.models.tables import SectorScore
+    from backend.services.sector_analyzer import classify_trend
     latest_date = db.query(SectorScore.date).order_by(SectorScore.date.desc()).first()
     if not latest_date:
         return []
@@ -570,7 +579,14 @@ async def get_all_sectors(db: Session = Depends(get_db)):
             "is_making_higher_highs": s.is_making_higher_highs,
             "is_making_higher_lows": getattr(s, 'is_making_higher_lows', None),
             "is_ema_aligned": getattr(s, 'is_ema_aligned', None),
-            "trend": "—",
+            "trend": classify_trend(
+                s.daily_rs if s.daily_rs is not None else (s.relative_strength or 0),
+                s.weekly_rs if s.weekly_rs is not None else (s.relative_strength or 0),
+                s.monthly_rs if s.monthly_rs is not None else (s.relative_strength or 0),
+                {"above_20ema": s.is_above_20ema, "above_50ema": s.is_above_50ema,
+                 "ema_aligned": getattr(s, "is_ema_aligned", None),
+                 "higher_highs": s.is_making_higher_highs},
+            ),
             "date": str(s.date),
             "stock_count": len(stocks),
             "active_signals": active_signals,
@@ -578,49 +594,24 @@ async def get_all_sectors(db: Session = Depends(get_db)):
     return results
 
 
+@router.get("/sectors/rotation")
+def get_sector_rotation():
+    """Relative Rotation Graph data (daily + weekly), computed at the last sector refresh."""
+    from backend.services.sector_rotation import load_rotation
+
+    return load_rotation()
+
+
 @router.get("/sectors/{sector_name}/stocks")
 def get_sector_stocks(sector_name: str, db: Session = Depends(get_db)):
-    """Get all stocks in a sector with their signal status."""
-    symbols = get_stocks_in_sector(sector_name)
-    if not symbols:
-        return []
+    """
+    Every official constituent of a sector index, matched to Dhan instruments
+    (ISIN first, then NSE symbol), with F&O status, lot size and signal status.
+    Constituents not found on Dhan are kept and flagged instead of dropped.
+    """
+    from backend.services.sector_mapping import sector_stocks
 
-    # Search in both trading_symbol and symbol fields to handle different symbol formats
-    from sqlalchemy import or_
-    instruments = db.query(Instrument).filter(
-        or_(
-            Instrument.trading_symbol.in_(symbols),
-            Instrument.symbol.in_(symbols)
-        ),
-        Instrument.exchange == "NSE",
-    ).all()
-
-    trading_syms = [inst.trading_symbol for inst in instruments if inst.trading_symbol]
-    active_signals = db.query(Signal).filter(
-        Signal.symbol.in_(trading_syms),
-        Signal.status.in_(["active", "exploded"]),
-    ).all() if trading_syms else []
-    signal_map = {s.symbol: s for s in active_signals}
-
-    results = []
-    for inst in instruments:
-        tsym = inst.trading_symbol or inst.symbol
-        sig = signal_map.get(tsym)
-        results.append({
-            "symbol": tsym,
-            "display_name": inst.display_name,
-            "security_id": inst.security_id,
-            "is_fno": inst.is_fno,
-            "lot_size": inst.lot_size,
-            "has_signal": sig is not None,
-            "signal_status": sig.status if sig else None,
-            "signal_score": sig.current_score if sig else None,
-            "signal_type": sig.signal_type if sig else None,
-            "occurrence_number": sig.occurrence_number if sig else None,
-        })
-
-    results.sort(key=lambda x: (not x["has_signal"], -(x["signal_score"] or 0)))
-    return results
+    return sector_stocks(db, sector_name)
 
 
 @router.post("/reset/signals")

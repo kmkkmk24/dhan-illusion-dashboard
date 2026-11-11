@@ -129,13 +129,20 @@ class DhanClient:
         to_date: date,
         expiry_code: int = 0,
     ) -> Optional[pd.DataFrame]:
-        """Single POST /charts/historical (must stay within API max date span)."""
+        """
+        Single POST /charts/historical (must stay within API max date span).
+
+        `to_date` is INCLUSIVE here, as every caller assumes. Dhan's `toDate` is
+        documented as non-inclusive, so we send the following day; otherwise the
+        candle for `to_date` (usually today) is silently dropped, and chunked
+        fetches lose one day at every chunk boundary.
+        """
         payload = {
             "securityId": _coerce_security_id_for_api(security_id),
             "exchangeSegment": exchange_segment,
             "instrument": instrument,
             "fromDate": from_date.strftime("%Y-%m-%d"),
-            "toDate": to_date.strftime("%Y-%m-%d"),
+            "toDate": (to_date + timedelta(days=1)).strftime("%Y-%m-%d"),
             "expiryCode": expiry_code,
         }
         max_attempts = 6

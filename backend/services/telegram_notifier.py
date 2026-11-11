@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from datetime import date
 from html import escape
@@ -9,8 +11,7 @@ import httpx
 
 from backend.config import get_config
 from backend.models.database import get_session_factory
-from backend.models.tables import Instrument, SectorScore, Signal
-from backend.services.sector_mapping import get_stocks_in_sector
+from backend.models.tables import SectorScore
 
 logger = logging.getLogger(__name__)
 _TELEGRAM_OFFSET: int = 0
@@ -175,7 +176,13 @@ def build_sector_report_message(results: list[dict], *, report_date: date, top_n
     return "\n".join(lines)
 
 
-def build_sector_report_keyboard(results: list[dict], *, top_n: int = 5) -> dict[str, Any] | None:
+_Q_DOT = {"Leading": "🟢", "Improving": "🔵", "Weakening": "🟠", "Lagging": "🔴"}
+
+
+def build_sector_report_keyboard(
+    results: list[dict], *, top_n: int = 5, quadrants: dict[str, str] | None = None
+) -> dict[str, Any] | None:
+    """One button per sector (ranked), prefixed with its Daily quadrant colour when known."""
     if not results:
         return None
     ranked = sorted(results, key=lambda x: float(x.get("combined_score") or 0), reverse=True)
@@ -187,7 +194,9 @@ def build_sector_report_keyboard(results: list[dict], *, top_n: int = 5) -> dict
         name = str(s.get("sector_name") or "").strip()
         if not name:
             continue
-        row.append({"text": name.replace("Nifty ", ""), "callback_data": f"sec:{name}"})
+        dot = _Q_DOT.get((quadrants or {}).get(name, ""), "")
+        label = name.replace("Nifty ", "")
+        row.append({"text": f"{dot} {label}".strip(), "callback_data": f"sec:{name}"})
         if len(row) == 3:
             buttons.append(row)
             row = []
@@ -196,127 +205,121 @@ def build_sector_report_keyboard(results: list[dict], *, top_n: int = 5) -> dict
     return {"inline_keyboard": buttons} if buttons else None
 
 
-def _load_latest_sector_rows() -> list[dict]:
-    session = get_session_factory()()
-    try:
-        latest_date = session.query(SectorScore.date).order_by(SectorScore.date.desc()).first()
-        if not latest_date:
-            return []
-        rows = (
-            session.query(SectorScore)
-            .filter(SectorScore.date == latest_date[0])
-            .order_by(SectorScore.combined_score.desc())
-            .all()
+def _sector_stats(session, sector: str) -> dict:
+    """Score, trend, rotation quadrants, turn and returns for one sector (best effort)."""
+    from backend.services.sector_analyzer import classify_trend
+    from backend.services.sector_rotation import load_rotation
+
+    stats: dict[str, Any] = {}
+    row = (session.query(SectorScore).filter(SectorScore.sector_name == sector)
+           .order_by(SectorScore.date.desc()).first())
+    if row is not None:
+        stats["score"] = round((row.combined_score or 0) * 100)
+        base = row.relative_strength or 0
+        stats["trend"] = classify_trend(
+            row.daily_rs if row.daily_rs is not None else base,
+            row.weekly_rs if row.weekly_rs is not None else base,
+            row.monthly_rs if row.monthly_rs is not None else base,
+            {"above_20ema": row.is_above_20ema, "above_50ema": row.is_above_50ema,
+             "ema_aligned": row.is_ema_aligned, "higher_highs": row.is_making_higher_highs},
         )
-        return [
-            {
-                "sector_name": r.sector_name,
-                "combined_score": r.combined_score,
-                "trend": "Strong" if (r.combined_score or 0) >= 0.65 else "Moderate" if (r.combined_score or 0) >= 0.45 else "Weak",
-                "date": str(r.date),
-            }
-            for r in rows
-        ]
-    finally:
-        session.close()
+    try:
+        rotation = load_rotation() or {}
+    except Exception:
+        rotation = {}
+    tfs = rotation.get("timeframes") or {}
+    for tf in ("daily", "weekly"):
+        hit = next((r for r in (tfs.get(tf) or {}).get("sectors", []) if r.get("sector_name") == sector), None)
+        stats[f"{tf}_quadrant"] = hit.get("quadrant") if hit else None
+    perf = next((p for p in rotation.get("performance") or [] if p.get("sector_name") == sector), None)
+    stats["returns"] = (perf or {}).get("returns") or {}
+    d, w, t = stats.get("daily_quadrant"), stats.get("weekly_quadrant"), stats.get("trend")
+    if t in ("Weak", "Bearish") and d in ("Improving", "Leading") and w in ("Improving", "Leading"):
+        stats["turn"] = "↗ Turning up"
+    elif t in ("Strong", "Moderate") and d in ("Weakening", "Lagging") and w in ("Weakening", "Lagging"):
+        stats["turn"] = "↘ Cooling"
+    return stats
 
 
-def _build_sector_drilldown_message(sector_name: str) -> str:
+def build_sector_drilldown(sector_name: str) -> tuple[str, dict]:
+    """Rich drill-down message + buttons for one sector (official constituents, signals, lots)."""
+    from backend.services.sector_mapping import sector_stocks
+    from backend.services.sector_report_card import build_sector_drilldown as fmt
+
     sector = str(sector_name or "").strip()
-    stocks = get_stocks_in_sector(sector)
-    if not stocks:
-        return f"🔍 <b>{escape(sector)}</b>\nNo mapped stocks found."
-
     session = get_session_factory()()
     try:
-        from sqlalchemy import or_
-
-        instruments = (
-            session.query(Instrument)
-            .filter(
-                or_(
-                    Instrument.trading_symbol.in_(stocks),
-                    Instrument.symbol.in_(stocks),
-                ),
-                Instrument.exchange == "NSE",
-            )
-            .all()
-        )
-        if not instruments:
-            return f"📌 <b>{escape(sector)}</b>\nNo instrument records found."
-
-        symbol_keys = []
-        for inst in instruments:
-            if inst.trading_symbol:
-                symbol_keys.append(str(inst.trading_symbol))
-            if inst.symbol:
-                symbol_keys.append(str(inst.symbol))
-
-        sigs = (
-            session.query(Signal)
-            .filter(Signal.symbol.in_(symbol_keys), Signal.status.in_(["active", "exploded"]))
-            .all()
-        )
+        payload = sector_stocks(session, sector)
+        stats = _sector_stats(session, sector)
     finally:
         session.close()
+    if not payload.get("stocks"):
+        return f"📌 <b>{escape(sector)}</b>\nNo constituents found for this sector.", {}
+    return fmt(payload, stats)
 
-    sig_map = {str(s.symbol): s for s in sigs}
-    rows: list[dict] = []
-    for inst in instruments:
-        tsym = str(inst.trading_symbol or inst.symbol or "").strip()
-        sig = sig_map.get(tsym) or sig_map.get(str(inst.symbol or ""))
-        rows.append({
-            "symbol": tsym or str(inst.symbol or "-"),
-            "name": str(inst.display_name or inst.symbol or tsym or "-"),
-            "is_fno": bool(inst.is_fno),
-            "lot": int(inst.lot_size or 0),
-            "signal": sig,
-        })
 
-    rows.sort(
-        key=lambda r: (
-            not bool(r["signal"]),
-            -float((r["signal"].current_score if r["signal"] else 0) or 0),
-            r["symbol"],
-        )
-    )
-    active_count = sum(1 for r in rows if r["signal"])
-    lines = [
-        f"📌 <b>{escape(sector)}</b>",
-        f"Constituents: <b>{len(rows)}</b> · Active signals: <b>{active_count}</b>",
-        "",
-        "<pre>",
-        f"{'SYMBOL':<10} {'NAME':<16} {'TP':<3} {'LOT':>5} {'SIGNAL':<10}",
-        "-" * 50,
-    ]
-
-    for row in rows[:30]:
-        sym = str(row["symbol"])[:10]
-        name = str(row["name"]).replace("Limited", "").replace("Ltd", "").strip()
-        if len(name) > 16:
-            name = name[:15] + "…"
-        tp = "F&O" if row["is_fno"] else "EQ"
-        lot = str(row["lot"] or "-")
-        sig = row["signal"]
-        if sig:
-            score = f"{float(sig.current_score or 0) * 100:.0f}%"
-            raw_type = str(sig.signal_type or "").lower()
-            stype = "BRK" if raw_type == "explosion" else "VCP"
-            signal_txt = f"{stype}-{score}"
-        else:
-            signal_txt = "-"
-        lines.append(f"{sym:<10} {name:<16} {tp:<3} {lot:>5} {signal_txt:<10}")
-
-    lines.append("</pre>")
-    if len(rows) > 30:
-        lines.append(f"... showing first 30 of {len(rows)}")
-    return "\n".join(lines)
+async def send_telegram_photo(
+    *,
+    photo: bytes,
+    caption: str,
+    reply_markup: dict[str, Any] | None = None,
+    chat_id: str | None = None,
+    filename: str = "report.png",
+) -> dict[str, Any]:
+    """Send a PNG with an HTML caption (max 1024 chars) and optional inline keyboard."""
+    token, configured_chat_id = _telegram_settings()
+    target_chat = str(chat_id or configured_chat_id or "").strip()
+    if not token or not target_chat:
+        return {"ok": False, "reason": "telegram_not_configured"}
+    data = {"chat_id": target_chat, "caption": caption, "parse_mode": "HTML"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    try:
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            response = await client.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data,
+                                         files={"photo": (filename, photo, "image/png")})
+        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.status_code >= 400 or not body.get("ok"):
+            logger.warning("Telegram photo send failed: status=%s body=%s", response.status_code, body)
+            return {"ok": False, "reason": "telegram_api_error", "status_code": response.status_code,
+                    "error": body.get("description")}
+        return {"ok": True, "message_id": (body.get("result") or {}).get("message_id")}
+    except Exception as exc:
+        logger.exception("Telegram photo send exception")
+        return {"ok": False, "reason": "telegram_exception", "error": str(exc)}
 
 
 async def send_sector_report(results: list[dict], *, report_date: date, top_n: int = 5) -> dict[str, Any]:
-    message = build_sector_report_message(results, report_date=report_date, top_n=top_n)
-    keyboard = build_sector_report_keyboard(results, top_n=top_n)
-    return await send_telegram_message_ex(message=message, parse_mode="HTML", reply_markup=keyboard)
+    """
+    Sector report: an image card (quadrants, rotation map, leaderboard) with a short
+    caption of the takeaways and one button per sector for the stock drill-down.
+    Falls back to a formatted text message if the image can't be rendered or sent.
+    """
+    from backend.services import sector_report_card as card
+    from backend.services.sector_rotation import load_rotation
+
+    if not results:
+        return await send_telegram_message_ex(message=build_sector_report_message(results, report_date=report_date),
+                                              parse_mode="HTML", reply_markup=None)
+    try:
+        rotation = load_rotation()
+    except Exception:
+        rotation = None
+    digest = card.build_digest(results, rotation, report_date=report_date)
+    keyboard = build_sector_report_keyboard(
+        results, top_n=top_n, quadrants={n: r["quadrant"] for n, r in digest["daily"].items()})
+    try:
+        png = await asyncio.to_thread(card.render_card, digest)
+        sent = await send_telegram_photo(photo=png, caption=card.build_caption(digest), reply_markup=keyboard,
+                                         filename=f"sectors_{digest['date']}.png")
+        if sent.get("ok"):
+            return {**sent, "format": "image"}
+        logger.warning("Sector card photo failed (%s); sending text instead", sent.get("error"))
+    except Exception:
+        logger.exception("Sector card render failed; sending text instead")
+    sent = await send_telegram_message_ex(message=card.build_text_report(digest), parse_mode="HTML",
+                                          reply_markup=keyboard)
+    return {**sent, "format": "text"}
 
 
 async def _telegram_api_call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -373,8 +376,12 @@ async def process_telegram_callbacks() -> dict[str, Any]:
         if not chat_id or not cb_id or not sector_name:
             continue
 
-        detail = _build_sector_drilldown_message(sector_name)
-        await send_telegram_message_ex(message=detail, parse_mode="HTML", chat_id=str(chat_id))
+        detail, keyboard = build_sector_drilldown(sector_name)
+        sent = await send_telegram_message_ex(message=detail, parse_mode="HTML", chat_id=str(chat_id),
+                                              reply_markup=keyboard or None)
+        if not sent.get("ok") and keyboard:
+            # e.g. an older Bot API without copy buttons: retry without the keyboard
+            await send_telegram_message_ex(message=detail, parse_mode="HTML", chat_id=str(chat_id))
         await _telegram_api_call("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"{sector_name} details sent"})
         handled += 1
 

@@ -27,6 +27,25 @@ def get_backup_path() -> Path:
     return Path(backup_path) if backup_path else DATA_DIR / "backups"
 
 
+def _sqlite_copy(src_path: Path, dst_path: Path, *, single_file: bool = True) -> None:
+    """
+    Copy one SQLite database into another with the online backup API (reads
+    through the live DB's WAL, so recent commits are included). A backup file is
+    switched to rollback-journal mode so it stays one self-contained file.
+    """
+    from backend.models.database import SQLITE_BUSY_TIMEOUT_S
+
+    src = sqlite3.connect(str(src_path), timeout=SQLITE_BUSY_TIMEOUT_S)
+    dst = sqlite3.connect(str(dst_path), timeout=SQLITE_BUSY_TIMEOUT_S)
+    try:
+        src.backup(dst)
+        if single_file:
+            dst.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        dst.close()
+        src.close()
+
+
 def _resolve_backup_file(backup_dir: Path, backup_filename: str) -> Path:
     """
     Only accept a bare file name of the form trades_*.db that resolves inside
@@ -79,13 +98,7 @@ def create_backup(custom_path: str | None = None) -> dict:
     backup_filename = f"trades_{timestamp}.db"
     backup_filepath = backup_dir / backup_filename
 
-    source = sqlite3.connect(str(db_path))
-    dest = sqlite3.connect(str(backup_filepath))
-    try:
-        source.backup(dest)
-    finally:
-        dest.close()
-        source.close()
+    _sqlite_copy(db_path, backup_filepath)
 
     size_mb = backup_filepath.stat().st_size / (1024 * 1024)
 
@@ -160,24 +173,20 @@ def restore_backup(backup_filename: str) -> dict:
 
     if db_path.exists():
         pre_restore_path = backup_dir / f"trades_pre_restore_{stamp}.db"
-        src, dst = sqlite3.connect(str(db_path)), sqlite3.connect(str(pre_restore_path))
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-            src.close()
+        _sqlite_copy(db_path, pre_restore_path)
         logger.info(f"Pre-restore backup created: {pre_restore_path}")
 
-    src, dst = sqlite3.connect(str(backup_filepath)), sqlite3.connect(str(db_path))
-    try:
-        src.backup(dst)
-    finally:
-        dst.close()
-        src.close()
+    # Into the live DB: keep its mode; reconnecting re-applies WAL + busy_timeout.
+    _sqlite_copy(backup_filepath, db_path, single_file=False)
 
-    from backend.models.database import get_engine
+    from backend.models.database import get_engine, upgrade_db
     get_engine().dispose()
     logger.info(f"Database restored from: {backup_filepath}")
+    # An older backup may predate the current schema (or Alembic): migrate it now.
+    try:
+        upgrade_db()
+    except Exception as e:
+        logger.error("Schema upgrade after restore failed: %s", e, exc_info=True)
 
     return {
         "restored_from": backup_filepath.name,

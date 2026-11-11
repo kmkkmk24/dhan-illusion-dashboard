@@ -49,7 +49,7 @@ from sqlalchemy.orm import Session
 from backend.config import get_config
 from backend.models.tables import Signal, SignalHistory, Instrument
 from backend.services.dhan_client import DhanClient
-from backend.services.sector_mapping import get_sectors_for_stock
+from backend.services.sector_mapping import sectors_for_instrument
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +350,7 @@ class VCPScanner:
             sym_l = (symbol or "").lower()
             if exclude_etf and exclude_kw and any(k in sym_l for k in exclude_kw):
                 continue
-            stock_sectors = get_sectors_for_stock(symbol)
+            stock_sectors = sectors_for_instrument(instrument)
             if self.require_known_sector and not stock_sectors:
                 continue
             in_top = bool(top_sectors) and any(sector in top_sectors for sector in stock_sectors)
@@ -404,7 +404,7 @@ class VCPScanner:
         
         for instrument in instruments:
             symbol = instrument.trading_symbol or instrument.symbol
-            stock_sectors = get_sectors_for_stock(symbol)
+            stock_sectors = sectors_for_instrument(instrument)
             
             # Check if stock belongs to any top sector
             if any(sector in top_sectors for sector in stock_sectors):
@@ -663,7 +663,7 @@ class VCPScanner:
             result["contractions_found"] = result["contractions_weekly"]
 
             symbol = instrument.trading_symbol or instrument.symbol
-            stock_sectors = get_sectors_for_stock(symbol)
+            stock_sectors = sectors_for_instrument(instrument)
             if stock_sectors and top_sectors and any(
                 sector in top_sectors for sector in stock_sectors
             ):
@@ -747,7 +747,7 @@ class VCPScanner:
             result["relative_strength"] = rs
 
             symbol = instrument.trading_symbol or instrument.symbol
-            stock_sectors = get_sectors_for_stock(symbol)
+            stock_sectors = sectors_for_instrument(instrument)
             in_top_sector = bool(stock_sectors) and bool(top_sectors) and any(
                 sector in top_sectors for sector in stock_sectors
             )
@@ -984,7 +984,7 @@ class VCPScanner:
                     consol_score=vcp_result["contraction_score"],
                     breakout_score=vcp_result["volume_score"],
                     status="active",
-                    sector=get_sectors_for_stock(instrument.trading_symbol or instrument.symbol)[0] if get_sectors_for_stock(instrument.trading_symbol or instrument.symbol) else None,
+                    sector=(sectors_for_instrument(instrument) or [None])[0],
                     close_price_at_detection=vcp_result.get("current_price", 0.0)
                 )
                 

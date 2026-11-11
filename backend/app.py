@@ -16,6 +16,7 @@ from backend.api import (
     value_investing,
     auth,
     market_direction,
+    ipos,
 )
 from backend.services.auth_service import ensure_seed_users, get_user_by_session
 
@@ -99,6 +100,7 @@ app.include_router(settings.router)
 app.include_router(index_trading.router)
 app.include_router(value_investing.router)
 app.include_router(market_direction.router)
+app.include_router(ipos.router)
 
 
 # Health check

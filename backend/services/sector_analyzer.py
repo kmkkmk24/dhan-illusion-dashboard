@@ -44,6 +44,16 @@ SECTOR_INDICES = {
     "Nifty Pharma": "32",
     "Nifty Private Bank": "15",
     "Nifty Realty": "34",
+    # Thematic indices
+    "Nifty India Defence": "493",
+    "Nifty CPSE": "45",
+    "Nifty IPO": "816",
+    "Nifty New Age Consumption": "822",
+    "Nifty EV & New Age Auto": "491",
+    "Nifty Housing": "814",
+    "Nifty India Digital": "473",
+    "Nifty India Tourism": "815",
+    "Nifty MNC": "44",
 }
 
 NIFTY_50_SECURITY_ID = "13"
@@ -55,6 +65,55 @@ TIMEFRAME_PERIODS = {
     "monthly": [20, 30, 50],
 }
 INTRADAY_RS_PERIODS_15M = [5, 10, 20]  # ~75m, 150m, 300m
+ROTATION_HISTORY_DAYS = 320
+
+
+def _since(df: pd.DataFrame, start: date) -> pd.DataFrame:
+    """Rows on/after `start` (keeps score inputs identical to the old 180-day fetch)."""
+    ts = pd.to_datetime(df["timestamp"])
+    return df[ts.dt.date >= start].reset_index(drop=True)
+
+
+def with_intraday_today(daily: Optional[pd.DataFrame], intraday: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """
+    Dhan's daily candles only include a session from the next day on. Build the
+    missing latest day(s) from 15-minute candles (open of the first bar, max high,
+    min low, close of the last bar) so the analysis is as of today. During market
+    hours that candle is partial, like any live chart.
+    """
+    if daily is None or daily.empty or intraday is None or intraday.empty:
+        return daily
+    try:
+        last_daily = pd.to_datetime(daily["timestamp"]).dt.normalize().max()
+        bars = intraday.copy()
+        bars["timestamp"] = pd.to_datetime(bars["timestamp"])
+        bars["day"] = bars["timestamp"].dt.normalize()
+        bars = bars[bars["day"] > last_daily].sort_values("timestamp")
+        if bars.empty:
+            return daily
+        extra = bars.groupby("day").agg(
+            open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"),
+            volume=("volume", "sum") if "volume" in bars else ("close", "size"),
+        ).reset_index().rename(columns={"day": "timestamp"})
+        out = daily.copy()
+        out["timestamp"] = pd.to_datetime(out["timestamp"])
+        return pd.concat([out, extra[[c for c in out.columns if c in extra.columns]]], ignore_index=True)
+    except Exception as e:  # never break the analysis over the extra candle
+        logger.warning("Could not add today's candle from intraday data: %s", e)
+        return daily
+
+
+def classify_trend(daily_rs: float, weekly_rs: float, monthly_rs: float, pa_details: dict) -> str:
+    """Classify sector trend as Strong / Moderate / Weak / Bearish."""
+    avg_rs = (daily_rs + weekly_rs + monthly_rs) / 3
+    bullish_checks = sum(bool(pa_details.get(k)) for k in ("above_20ema", "above_50ema", "ema_aligned", "higher_highs"))
+    if avg_rs >= 0.65 and bullish_checks >= 3:
+        return "Strong"
+    if avg_rs >= 0.45 and bullish_checks >= 2:
+        return "Moderate"
+    if avg_rs >= 0.3:
+        return "Weak"
+    return "Bearish"
 
 
 class SectorAnalyzer:
@@ -71,23 +130,35 @@ class SectorAnalyzer:
         """
         today = date.today()
         from_date = today - timedelta(days=180)
+        # Longer history feeds the rotation graph (weekly RRG needs ~30 weeks);
+        # 320 days stays within one Dhan historical request. Scores below still
+        # use exactly the last 180 days, as before.
+        history_from = today - timedelta(days=ROTATION_HISTORY_DAYS)
 
-        nifty_df = await self._fetch_index_data(NIFTY_50_SECURITY_ID, from_date, today)
-        if nifty_df is None:
+        nifty_full = await self._fetch_index_data(NIFTY_50_SECURITY_ID, history_from, today)
+        if nifty_full is None:
             logger.error("Could not fetch Nifty 50 data for sector analysis")
             return []
         nifty_intraday = await self._fetch_intraday_15m_data(NIFTY_50_SECURITY_ID)
+        nifty_full = with_intraday_today(nifty_full, nifty_intraday)
+        nifty_df = _since(nifty_full, from_date)
 
         results = []
+        rotation_frames = {}
 
         for i, (sector_name, security_id) in enumerate(SECTOR_INDICES.items()):
             try:
                 if i > 0:
                     await asyncio.sleep(0.35)
-                sector_df = await self._fetch_index_data(security_id, from_date, today)
-                if sector_df is None or len(sector_df) < 50:
+                sector_full = await self._fetch_index_data(security_id, history_from, today)
+                if sector_full is None:
                     continue
                 sector_intraday = await self._fetch_intraday_15m_data(security_id)
+                sector_full = with_intraday_today(sector_full, sector_intraday)
+                rotation_frames[sector_name] = sector_full
+                sector_df = _since(sector_full, from_date)
+                if len(sector_df) < 50:
+                    continue
 
                 # Multi-timeframe relative strength
                 daily_rs = self._compute_rs_for_periods(sector_df, nifty_df, TIMEFRAME_PERIODS["daily"])
@@ -140,6 +211,13 @@ class SectorAnalyzer:
 
         self.db.commit()
         await self.dhan.close()
+
+        try:
+            from backend.services.sector_rotation import build_rotation, save_rotation
+
+            save_rotation(build_rotation(rotation_frames, nifty_full))
+        except Exception as e:  # rotation is additive; never fail the analysis for it
+            logger.error(f"Sector rotation computation failed: {e}", exc_info=True)
 
         results.sort(key=lambda x: x["combined_score"], reverse=True)
 
@@ -268,23 +346,7 @@ class SectorAnalyzer:
     def _classify_trend(
         self, daily_rs: float, weekly_rs: float, monthly_rs: float, pa_details: dict
     ) -> str:
-        """Classify sector trend as Strong / Moderate / Weak / Bearish."""
-        avg_rs = (daily_rs + weekly_rs + monthly_rs) / 3
-        bullish_checks = sum([
-            pa_details["above_20ema"],
-            pa_details["above_50ema"],
-            pa_details["ema_aligned"],
-            pa_details["higher_highs"],
-        ])
-
-        if avg_rs >= 0.65 and bullish_checks >= 3:
-            return "Strong"
-        elif avg_rs >= 0.45 and bullish_checks >= 2:
-            return "Moderate"
-        elif avg_rs >= 0.3:
-            return "Weak"
-        else:
-            return "Bearish"
+        return classify_trend(daily_rs, weekly_rs, monthly_rs, pa_details)
 
     def _count_active_signals(self, stock_symbols: list[str]) -> int:
         """Count how many stocks in the list have active VCP signals."""

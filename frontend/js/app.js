@@ -203,9 +203,8 @@ function toggleTheme() {
     localStorage.setItem('vcp-theme', next);
     updateThemeIcons(next);
 
-    if (_selectedSector && window._lastSectors) {
-        loadSectorChart(_selectedSector);
-    }
+    if (_selectedSector) loadSectorChart(_selectedSector);
+    if (_sxRotation) sxRenderRrg(false);
 }
 
 function updateThemeIcons(theme) {
@@ -341,6 +340,7 @@ function switchTab(tab) {
         loadSectorsTab();
         syncSectorTelegramToggle();
     }
+    if (tab === 'ipos') { loadIposTab(); }
     if (tab === 'market-direction') { loadMarketDirection(); }
     if (tab === 'swing') { loadSignals('swing'); showVcpInfo(); }
     if (tab === 'fno') { loadFnoSignals(); loadSchedulerStatus(); switchFnoSubTab(fnoSubTab); }
@@ -354,261 +354,81 @@ function switchTab(tab) {
     }
 }
 
-// --- Sector Analysis Tab ---
-
-function _marketBiasColor(bias) {
-    const b = String(bias || '').toUpperCase();
-    if (b.includes('STRONGLY BULLISH')) return '#16a34a';
-    if (b.includes('BULLISH')) return '#22c55e';
-    if (b.includes('STRONGLY BEARISH')) return '#dc2626';
-    if (b.includes('BEARISH')) return '#ef4444';
-    return '#eab308';
-}
-
-function _marketBiasBadge(bias) {
-    return `<span class="text-2xs px-2 py-1 rounded-full" style="background:rgba(99,102,241,0.12);color:${_marketBiasColor(bias)};font-weight:700">${bias || 'SIDEWAYS / RANGE-BOUND'}</span>`;
-}
-
-async function sendMarketDirectionHistoryToTelegram(predictionId, btnEl = null) {
-    if (!predictionId) return;
-    const statusEl = document.getElementById('market-direction-status');
-    const oldText = btnEl ? btnEl.textContent : '';
-    if (btnEl) {
-        btnEl.disabled = true;
-        btnEl.textContent = 'Sending...';
-    }
-    try {
-        const resp = await fetch(`${API_BASE}/api/market-direction/history/${predictionId}/notify`, {
-            method: 'POST',
-        });
-        const data = await resp.json();
-        if (!resp.ok || !data?.ok) throw new Error(data?.message || data?.detail || 'Send failed');
-        if (statusEl) {
-            statusEl.textContent = 'AI prediction sent to Telegram';
-            statusEl.style.color = '#22c55e';
-        }
-    } catch (err) {
-        if (statusEl) {
-            statusEl.textContent = `Telegram send failed: ${err.message}`;
-            statusEl.style.color = '#ef4444';
-        }
-    } finally {
-        if (btnEl) {
-            btnEl.disabled = false;
-            btnEl.textContent = oldText || 'Send';
-        }
-    }
-}
-
-let _marketDirectionSubTab = 'today';
-let _marketDirectionDashboard = null;
-
-function switchMarketDirectionSubTab(tab, btnEl = null) {
-    _marketDirectionSubTab = tab || 'today';
-    const wrap = document.getElementById('market-direction-subtab');
-    if (wrap) {
-        wrap.querySelectorAll('.filter-pill').forEach((el) => {
-            el.classList.toggle('active', el.dataset.value === _marketDirectionSubTab);
-        });
-    } else if (btnEl) {
-        document.querySelectorAll('#market-direction-subtab .filter-pill').forEach((el) => el.classList.remove('active'));
-        btnEl.classList.add('active');
-    }
-    if (_marketDirectionDashboard) renderMarketDirection(_marketDirectionDashboard);
-}
-
-async function loadMarketDirection(force = false) {
-    const statusEl = document.getElementById('market-direction-status');
-    const contentEl = document.getElementById('market-direction-content');
-    const btn = document.getElementById('btn-market-direction-refresh');
-    if (!statusEl || !contentEl) return;
-    if (btn) btn.disabled = true;
-    statusEl.textContent = 'Analyzing NIFTY and SENSEX...';
-    statusEl.style.color = 'var(--text-muted)';
-    if (force) {
-        contentEl.innerHTML = `<div class="p-8 text-center text-2xs" style="color:var(--text-muted)"><span class="spinner"></span> Refreshing prediction...</div>`;
-    }
-
-    try {
-        const resp = await fetch(`${API_BASE}/api/market-direction/dashboard${force ? '?force_refresh=true' : ''}`);
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data?.detail || 'Prediction failed');
-        _marketDirectionDashboard = data;
-        renderMarketDirection(data);
-        const ts = data.as_of ? new Date(data.as_of).toLocaleString() : 'n/a';
-        statusEl.textContent = `Updated: ${ts}`;
-        statusEl.style.color = '#22c55e';
-    } catch (err) {
-        contentEl.innerHTML = `<div class="p-6 text-center text-2xs" style="color:#ef4444">Market direction load failed: ${err.message}</div>`;
-        statusEl.textContent = 'Prediction unavailable';
-        statusEl.style.color = '#ef4444';
-    } finally {
-        if (btn) btn.disabled = false;
-    }
-}
-
-function renderMarketDirection(data) {
-    const contentEl = document.getElementById('market-direction-content');
-    if (!contentEl) return;
-    const section = _marketDirectionSubTab || 'today';
-    const todayPred = data?.today || {};
-    const tomorrowPred = data?.tomorrow || {};
-    const history = Array.isArray(data?.history) ? data.history : [];
-    const streak = data?.streak || {};
-    const timing = data?.timing || {};
-
-    const buildPredictionCard = (pred, heading, opts = {}) => {
-        const showOpenType = !!opts.showOpenType;
-        const probs = pred?.probabilities || {};
-        const breadth = pred?.breadth || {};
-        const indices = Array.isArray(pred?.indices) ? pred.indices : [];
-        const targetDate = pred?.target_date ? new Date(pred.target_date).toLocaleDateString() : '-';
-        const indexCards = indices.map((idx) => {
-            const tf = idx.timeframe_scores || {};
-            const notes = Array.isArray(idx.notes) ? idx.notes : [];
-            const snap = idx.technical_snapshot || {};
-            const session = idx.session_context || {};
-            const tfText = Object.entries(tf).map(([k, v]) => `${k.toUpperCase()}: ${(Number(v) * 100).toFixed(0)}`).join(' · ') || '-';
-            const unavailableNote = idx.analysis_ok ? '' : `<div class="text-2xs mb-1" style="color:#f59e0b">Data unavailable${idx.reason ? ` (${idx.reason})` : ''}</div>`;
-            const openType = session.open_type || 'UNKNOWN';
-            const gapText = Number.isFinite(Number(session.gap_pct)) ? ` (${Number(session.gap_pct).toFixed(2)}%)` : '';
-            return `
-                <div class="glass-card-sm p-2" style="min-width:280px">
-                    <div class="flex items-center justify-between mb-1">
-                        <span class="text-xs font-semibold" style="color:var(--text-heading)">${idx.index || '-'}</span>
-                        ${_marketBiasBadge(idx.bias)}
-                    </div>
-                    ${unavailableNote}
-                    ${showOpenType ? `<div class="text-2xs mb-1" style="color:var(--text-muted)">Open Type: <b style="color:var(--text-heading)">${openType}${gapText}</b></div>` : ''}
-                    <div class="text-2xs mb-1" style="color:var(--text-muted)">Confidence: <b style="color:var(--text-heading)">${idx.confidence ?? 0}%</b></div>
-                    <div class="text-2xs mb-1" style="color:var(--text-muted)">TF scores: ${tfText}</div>
-                    <div class="text-2xs mb-1" style="color:var(--text-muted)">
-                        EMA20 ${snap.ema20 ?? '-'} · EMA50 ${snap.ema50 ?? '-'} · EMA200 ${snap.ema200 ?? '-'} · RSI ${snap.rsi14 ?? '-'} · ADX ${snap.adx14 ?? '-'}
-                    </div>
-                    <div class="text-2xs" style="color:var(--text-muted)">
-                        ${(notes || []).slice(0, 3).map(n => `• ${n}`).join('<br/>') || '-'}
-                    </div>
-                </div>
-            `;
-        }).join('');
-        return `
-            <div class="mb-3">
-                <div class="flex items-center gap-2 mb-1">
-                    <span class="text-xs font-semibold" style="color:var(--text-heading)">${heading} (${targetDate})</span>
-                    ${_marketBiasBadge(pred.market_bias)}
-                    <span class="text-2xs" style="color:var(--text-muted)">Confidence:</span>
-                    <span class="text-xs font-bold" style="color:var(--text-heading)">${pred.confidence ?? 0}%</span>
-                </div>
-                <div class="text-2xs" style="color:var(--text-muted)">
-                    Probabilities → Bullish: <b>${probs.bullish ?? '-' }%</b> · Sideways: <b>${probs.sideways ?? '-' }%</b> · Bearish: <b>${probs.bearish ?? '-' }%</b>
-                </div>
-                <div class="text-2xs mt-1" style="color:var(--text-muted)">
-                    Sector breadth: <b>${breadth.strong_count ?? 0}/${breadth.total ?? 0}</b> strong sectors (${Math.round((Number(breadth.strong_share || 0)) * 100)}%)
-                </div>
-                <div class="text-2xs mt-1" style="color:var(--text-muted)">
-                    ${timing.note || ''}
-                </div>
-                ${pred.model_note ? `<div class="text-2xs mt-1" style="color:var(--text-muted)">${pred.model_note}</div>` : ''}
-                ${pred.note ? `<div class="text-2xs mt-1" style="color:#f59e0b">${pred.note}</div>` : ''}
-            </div>
-            <div class="grid md:grid-cols-2 gap-2">${indexCards || '<div class="text-2xs" style="color:var(--text-muted)">No index analysis data.</div>'}</div>
-            <div class="text-2xs mt-3" style="color:var(--text-muted)">${pred.disclaimer || ''}</div>
-        `;
-    };
-
-    const historyRows = history.map((row) => {
-        const result = String(row.result || 'PENDING').toUpperCase();
-        const resultColor = result === 'HIT' ? '#22c55e' : result === 'MISS' ? '#ef4444' : '#eab308';
-        const sendBtn = row.id
-            ? `<button class="btn-secondary px-2 py-1 rounded text-2xs" onclick="sendMarketDirectionHistoryToTelegram(${Number(row.id)}, this)">Send</button>`
-            : '-';
-        return `
-            <tr>
-                <td class="px-2 py-1">${row.target_date ? new Date(row.target_date).toLocaleDateString() : '-'}</td>
-                <td class="px-2 py-1">${(row.horizon || '-').toUpperCase()}</td>
-                <td class="px-2 py-1">${_marketBiasBadge(row.predicted_bias)}</td>
-                <td class="px-2 py-1">${row.confidence ?? 0}%</td>
-                <td class="px-2 py-1">${row.actual_bias ? _marketBiasBadge(row.actual_bias) : '<span class="text-2xs" style="color:var(--text-muted)">Pending</span>'}</td>
-                <td class="px-2 py-1"><span class="text-2xs font-semibold" style="color:${resultColor}">${result}</span></td>
-                <td class="px-2 py-1">${sendBtn}</td>
-            </tr>
-        `;
-    }).join('');
-
-    let sectionHtml = '';
-    if (section === 'tomorrow') {
-        sectionHtml = buildPredictionCard(tomorrowPred, 'Tomorrow', { showOpenType: false });
-    } else if (section === 'history') {
-        const streakValue = Number.isFinite(Number(streak.current)) ? Number(streak.current) : 0;
-        const streakHorizon = String(streak.horizon || 'tomorrow').toUpperCase();
-        sectionHtml = `
-            <div class="text-2xs mb-2" style="color:var(--text-muted)">Algo prediction vs actual market outcome.</div>
-            <div class="text-2xs mb-2" style="color:var(--text-heading)">Current HIT Streak (${streakHorizon}): <b style="color:#22c55e">${streakValue}</b> day(s)</div>
-            <div class="overflow-auto">
-                <table class="w-full text-2xs">
-                    <thead>
-                        <tr style="color:var(--text-muted);border-bottom:1px solid rgba(148,163,184,0.25)">
-                            <th class="text-left px-2 py-1">Date</th>
-                            <th class="text-left px-2 py-1">Type</th>
-                            <th class="text-left px-2 py-1">Predicted</th>
-                            <th class="text-left px-2 py-1">Confidence</th>
-                            <th class="text-left px-2 py-1">Actual</th>
-                            <th class="text-left px-2 py-1">Result</th>
-                            <th class="text-left px-2 py-1">Telegram</th>
-                        </tr>
-                    </thead>
-                    <tbody>${historyRows || '<tr><td colspan="7" class="px-2 py-3" style="color:var(--text-muted)">No history yet.</td></tr>'}</tbody>
-                </table>
-            </div>
-        `;
-    } else {
-        sectionHtml = buildPredictionCard(todayPred, 'Today', { showOpenType: true });
-    }
-
-    contentEl.innerHTML = `
-        ${sectionHtml}
-        <div class="text-2xs mt-3" style="color:var(--text-muted)">Today prediction reliable after: <b>${timing.today_reliable_after_ist || '09:45'} IST</b></div>
-    `;
-}
-
-// --- Sector Analysis Tab ---
+// --- Sector Analysis Tab (rotation map, money flow, heatmap, leaderboard) ---
 
 const SECTOR_TELEGRAM_TOGGLE_KEY = 'sector-telegram-on-refresh';
+const SX_TF_KEY = 'sector-rotation-timeframe';
 let _sectorTelegramOnRefresh = localStorage.getItem(SECTOR_TELEGRAM_TOGGLE_KEY) === 'true';
+let _selectedSector = null;
+let _sxSectors = [];          // leaderboard rows (/sectors/all)
+let _sxRotation = null;       // rotation payload (/sectors/rotation) or null
+let _sxTf = (() => { try { return localStorage.getItem(SX_TF_KEY) || 'daily'; } catch (_) { return 'daily'; } })();
+let _sxCur = {};              // sector -> current tail points [[ratio, momentum], ...] (animation state)
+let _sxAnim = 0;              // requestAnimationFrame id
+let _sxFocusName = null;
+let _sxResizeObs = null;
+
+const SX_QUADS = ['Leading', 'Improving', 'Weakening', 'Lagging'];
+const SX_KPI_VISIBLE = 4;     // sector chips shown per quadrant tile before "+N more"
+const _sxKpiOpen = new Set(); // quadrant tiles the user expanded
+const SX_Q_VAR = { Leading: '--sx-lead', Weakening: '--sx-weak', Lagging: '--sx-lag', Improving: '--sx-impr' };
+const SX_Q_HINT = {
+    Leading: 'Strong and still accelerating',
+    Improving: 'Weak but gaining momentum',
+    Weakening: 'Strong but losing momentum',
+    Lagging: 'Weak and losing momentum',
+};
+const SX_ARROW = '<svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+
+const sxShort = name => String(name || '').replace(/^Nifty\s+/i, '');
+const sxPct = v => (v === null || v === undefined || Number.isNaN(v)) ? '—' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+const sxEase = t => 1 - Math.pow(1 - t, 4);
+
+function sxColor(q) {
+    const root = document.getElementById('content-sectors');
+    return getComputedStyle(root).getPropertyValue(SX_Q_VAR[q] || '--sx-lead').trim() || '#22c55e';
+}
+
+function sxStatus(text, kind) {
+    const el = document.getElementById('sector-tab-status');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = `sx-status${kind ? ` sx-status--${kind}` : ''}`;
+}
+
+function sxRotationRows(tf = _sxTf) {
+    return _sxRotation?.timeframes?.[tf]?.sectors || [];
+}
+
+function sxRotationOf(name, tf = _sxTf) {
+    return sxRotationRows(tf).find(r => r.sector_name === name) || null;
+}
+
+function sxReturnsOf(name) {
+    return (_sxRotation?.performance || []).find(p => p.sector_name === name)?.returns || {};
+}
+
+function sxQChip(q, text) {
+    return q ? `<span class="sx-chip sx-chip--q" data-q="${stEsc(q)}">${stEsc(text || q)}</span>` : '';
+}
+
+// ── Telegram toggle ──
 
 function syncSectorTelegramToggle() {
     const btn = document.getElementById('btn-sector-telegram');
     if (!btn) return;
-    btn.textContent = 'T';
-    if (_sectorTelegramOnRefresh) {
-        btn.style.setProperty('border', '1px solid #16a34a', 'important');
-        btn.style.setProperty('background', '#16a34a', 'important');
-        btn.style.setProperty('background-image', 'none', 'important');
-        btn.style.setProperty('color', '#ffffff', 'important');
-    } else {
-        btn.style.setProperty('border', '1px solid rgba(107,114,128,0.45)', 'important');
-        btn.style.setProperty('background', 'rgba(107,114,128,0.12)', 'important');
-        btn.style.setProperty('background-image', 'none', 'important');
-        btn.style.setProperty('color', 'var(--text-muted)', 'important');
-    }
-    btn.style.fontWeight = '700';
+    btn.setAttribute('aria-checked', String(_sectorTelegramOnRefresh));
     btn.title = _sectorTelegramOnRefresh
-        ? 'Telegram on refresh: ON (click to disable)'
-        : 'Telegram on refresh: OFF (click to enable)';
+        ? 'Telegram report after refresh: ON (click to turn off)'
+        : 'Telegram report after refresh: OFF (click to turn on)';
 }
 
 function toggleSectorTelegramOnRefresh() {
     if (!isAdminUser()) return;
     _sectorTelegramOnRefresh = !_sectorTelegramOnRefresh;
-    localStorage.setItem(SECTOR_TELEGRAM_TOGGLE_KEY, _sectorTelegramOnRefresh ? 'true' : 'false');
+    try { localStorage.setItem(SECTOR_TELEGRAM_TOGGLE_KEY, _sectorTelegramOnRefresh ? 'true' : 'false'); } catch (_) {}
     syncSectorTelegramToggle();
-    const statusEl = document.getElementById('sector-tab-status');
-    if (statusEl) {
-        statusEl.textContent = _sectorTelegramOnRefresh
-            ? 'Telegram notify on refresh: ON'
-            : 'Telegram notify on refresh: OFF';
-        statusEl.style.color = _sectorTelegramOnRefresh ? '#22c55e' : 'var(--text-muted)';
-    }
+    sxStatus(`Telegram after refresh: ${_sectorTelegramOnRefresh ? 'on' : 'off'}`, _sectorTelegramOnRefresh ? 'ok' : '');
 }
 
 async function notifySectorReportToTelegram() {
@@ -620,28 +440,1176 @@ async function notifySectorReportToTelegram() {
     return data;
 }
 
+// ── Loading ──
+
 async function loadSectorsTab() {
-    try {
-        const response = await fetch(`${API_BASE}/api/settings/sectors/all`);
-        const sectors = await response.json();
+    const root = document.getElementById('content-sectors');
+    const getJson = url => fetch(url).then(r => (r.ok ? r.json() : null)).catch(() => null);
+    const [sectors, rotation] = await Promise.all([
+        getJson(`${API_BASE}/api/settings/sectors/all`),
+        getJson(`${API_BASE}/api/settings/sectors/rotation`),
+    ]);
+    _sxSectors = Array.isArray(sectors) ? sectors : [];
+    _sxRotation = rotation && rotation.available ? rotation : null;
+    window._lastSectors = _sxSectors;
+    renderSectorsTab();
 
-        if (!sectors.length) {
-            document.getElementById('sectors-table').innerHTML = `
-                <div class="p-10 text-center" style="color:var(--text-muted)">
-                    <p class="text-sm mb-1">No sector data yet</p>
-                    <p class="text-xs">Click "Refresh Sectors" to run analysis.</p>
-                </div>`;
-            return;
-        }
+    // Replay the staggered reveal each time the tab is opened.
+    root.classList.remove('sx-in');
+    void root.offsetWidth;
+    requestAnimationFrame(() => root.classList.add('sx-in'));
 
-        window._lastSectors = sectors;
-        renderSectorsTable(sectors);
-    } catch (err) {
-        console.error('Error loading sectors:', err);
+    if (!_sxResizeObs && 'ResizeObserver' in window) {
+        let pending = 0;
+        _sxResizeObs = new ResizeObserver(() => {
+            cancelAnimationFrame(pending);
+            pending = requestAnimationFrame(() => { sxSyncSeg(); sxRenderRrg(false); });
+        });
+        _sxResizeObs.observe(document.getElementById('sx-rrg-wrap'));
     }
 }
 
-let _selectedSector = null;
+function renderSectorsTab() {
+    sxRenderAsOf();
+    sxSyncSeg();
+    sxRenderKpis();
+    sxRenderAgree();
+    sxRenderFlow();
+    sxRenderHeat();
+    renderSectorsTable(_sxSectors);
+    sxRenderRrg(true);
+}
+
+function sxRenderAsOf() {
+    const el = document.getElementById('sx-asof');
+    if (!el) return;
+    if (_sxRotation) {
+        const updated = _sxRotation.generated_at ? new Date(_sxRotation.generated_at) : null;
+        el.textContent = `Relative strength vs ${_sxRotation.benchmark || 'Nifty 50'} · data as of ${_sxRotation.as_of || '—'}`
+            + (updated && !Number.isNaN(updated.getTime()) ? ` · computed ${updated.toLocaleString(undefined, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}` : '');
+    } else {
+        el.textContent = 'Relative strength of every Nifty sector against Nifty 50. Refresh to compute the rotation map.';
+    }
+}
+
+function setRotationTimeframe(tf) {
+    if (!['daily', 'weekly'].includes(tf) || tf === _sxTf) return;
+    _sxTf = tf;
+    try { localStorage.setItem(SX_TF_KEY, tf); } catch (_) {}
+    sxSyncSeg();
+    sxRenderKpis();
+    sxRenderFlow();
+    renderSectorsTable(_sxSectors);
+    sxRenderRrg(true);
+}
+
+function sxSyncSeg() {
+    const seg = document.getElementById('sx-tf');
+    if (!seg) return;
+    let active = null;
+    seg.querySelectorAll('button').forEach(b => {
+        const on = b.dataset.tf === _sxTf;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', String(on));
+        if (on) active = b;
+    });
+    const ink = seg.querySelector('.sx-seg-ink');
+    if (ink && active) {
+        ink.style.width = `${active.offsetWidth}px`;
+        ink.style.transform = `translateX(${active.offsetLeft}px)`;
+    }
+}
+
+// ── KPI tiles ──
+
+function sxRenderKpis() {
+    const box = document.getElementById('sx-kpis');
+    if (!box) return;
+    const rows = sxRotationRows();
+    const chip = r => `<button type="button" class="sx-chip" title="${stEsc(r.sector_name)}"
+        onclick="expandSector(${stEsc(JSON.stringify(r.sector_name))})">${stEsc(sxShort(r.sector_name))}</button>`;
+    box.innerHTML = SX_QUADS.map(q => {
+        const members = rows.filter(r => r.quadrant === q);
+        const extra = members.length - SX_KPI_VISIBLE;
+        const open = extra > 0 && _sxKpiOpen.has(q);
+        return `<div class="sx-kpi" data-q="${q}">
+            <div class="sx-kpi-top">
+                <span class="sx-kpi-label">${q}<button type="button" class="sx-info" data-help="q-${q}"
+                    aria-label="About ${q}" aria-expanded="false" aria-controls="sx-pop">i</button></span>
+                <span class="sx-kpi-count">${_sxRotation ? members.length : '—'}</span>
+            </div>
+            <div class="sx-kpi-hint">${SX_Q_HINT[q]}</div>
+            <div class="sx-kpi-names">${members.slice(0, SX_KPI_VISIBLE).map(chip).join('')}</div>
+            ${extra > 0 ? `
+                <div class="sx-kpi-more${open ? ' open' : ''}" id="sx-kpi-more-${q}">
+                    <div>${members.slice(SX_KPI_VISIBLE).map(chip).join('')}</div>
+                </div>
+                <button type="button" class="sx-kpi-toggle" aria-expanded="${open}" aria-controls="sx-kpi-more-${q}"
+                    data-more="+${extra} more" onclick="sxToggleKpi('${q}')">${open ? 'Show less' : `+${extra} more`}</button>` : ''}
+        </div>`;
+    }).join('');
+}
+
+/** Expand/collapse a quadrant tile in place (state survives re-renders). */
+function sxToggleKpi(q) {
+    const open = !_sxKpiOpen.has(q);
+    if (open) _sxKpiOpen.add(q); else _sxKpiOpen.delete(q);
+    const tile = document.querySelector(`#sx-kpis .sx-kpi[data-q="${q}"]`);
+    if (!tile) return;
+    tile.querySelector('.sx-kpi-more')?.classList.toggle('open', open);
+    const btn = tile.querySelector('.sx-kpi-toggle');
+    if (btn) {
+        btn.setAttribute('aria-expanded', String(open));
+        btn.textContent = open ? 'Show less' : btn.dataset.more;
+    }
+}
+
+// ── Daily × Weekly agreement ──
+
+let _sxAgreeMixedOpen = false;
+const SX_AGREE_ORDER = ['Leading', 'Improving', 'Weakening', 'Lagging'];
+
+/**
+ * Compare each sector's quadrant on the daily and weekly rotation views.
+ * Returns { confirmed: {Leading: [...], ...}, mixed: [...], total }.
+ */
+function sxAgreement() {
+    const daily = new Map(sxRotationRows('daily').map(r => [r.sector_name, r]));
+    const weekly = new Map(sxRotationRows('weekly').map(r => [r.sector_name, r]));
+    const names = [...new Set([...daily.keys(), ...weekly.keys()])];
+    const confirmed = Object.fromEntries(SX_AGREE_ORDER.map(q => [q, []]));
+    const mixed = [];
+    // Strength of a reading = distance of its latest point from the centre (100, 100).
+    const dist = r => {
+        const p = r?.trail?.[r.trail.length - 1];
+        return p ? Math.hypot(p.ratio - 100, p.momentum - 100) : 0;
+    };
+    for (const name of names) {
+        const d = daily.get(name), w = weekly.get(name);
+        if (d && w && d.quadrant === w.quadrant) {
+            confirmed[d.quadrant].push({ name, strength: dist(d) + dist(w) });
+        } else {
+            mixed.push({ name, daily: d?.quadrant || null, weekly: w?.quadrant || null });
+        }
+    }
+    SX_AGREE_ORDER.forEach(q => confirmed[q].sort((a, b) => b.strength - a.strength));
+    // Mixed: show the most actionable combinations first (anything involving Leading/Improving).
+    const rank = q => (q ? SX_AGREE_ORDER.indexOf(q) : 9);
+    mixed.sort((a, b) => Math.min(rank(a.daily), rank(a.weekly)) - Math.min(rank(b.daily), rank(b.weekly))
+        || a.name.localeCompare(b.name));
+    return { confirmed, mixed, total: names.length };
+}
+
+function sxRenderAgree() {
+    const box = document.getElementById('sx-agree');
+    const summary = document.getElementById('sx-agree-summary');
+    if (!box) return;
+    const hasBoth = sxRotationRows('daily').length && sxRotationRows('weekly').length;
+    if (!hasBoth) {
+        if (summary) summary.textContent = '';
+        box.innerHTML = `<div class="sx-empty"><b>Needs both timeframes</b>${
+            _sxRotation ? 'Not enough weekly history yet to compare.' : 'Press Refresh to compute the rotation map.'}</div>`;
+        return;
+    }
+    const { confirmed, mixed, total } = sxAgreement();
+    const agreeCount = SX_AGREE_ORDER.reduce((n, q) => n + confirmed[q].length, 0);
+    if (summary) summary.innerHTML = `<b>${agreeCount}</b> of ${total} agree`;
+
+    const chip = (name, extra = '') => `<button type="button" class="sx-chip${extra}" title="${stEsc(name)}"
+        onclick="expandSector(${stEsc(JSON.stringify(name))})"
+        onmouseenter="sxFocus(${stEsc(JSON.stringify(name))})" onmouseleave="sxFocus(null)">${stEsc(sxShort(name))}</button>`;
+
+    const cols = SX_AGREE_ORDER.map(q => {
+        const list = confirmed[q];
+        return `<div class="sx-agree-col" data-q="${q}">
+            <div class="sx-agree-top">
+                <span class="sx-kpi-label">${q} on both</span>
+                <span class="sx-agree-count">${list.length}</span>
+            </div>
+            <div class="sx-agree-chips">${list.length
+                ? list.map(x => chip(x.name)).join('')
+                : '<span class="sx-agree-none">None right now</span>'}</div>
+        </div>`;
+    }).join('');
+
+    const tag = (tf, q) => q
+        ? `<span class="sx-chip sx-chip--q" data-q="${q}">${tf} ${q}</span>`
+        : `<span class="sx-chip">${tf} n/a</span>`;
+    const mixedRows = mixed.map(m => `<div class="sx-agree-mixed-row">
+            ${chip(m.name, ' sx-chip--name')}
+            <span class="sx-agree-vs">${tag('Daily', m.daily)}${tag('Weekly', m.weekly)}</span>
+        </div>`).join('');
+
+    box.innerHTML = `<div class="sx-agree">${cols}</div>${mixed.length ? `
+        <button type="button" class="sx-agree-toggle" aria-expanded="${_sxAgreeMixedOpen}" aria-controls="sx-agree-mixed"
+            onclick="sxToggleAgreeMixed()">${_sxAgreeMixedOpen ? 'Hide' : 'Show'} ${mixed.length} mixed reading${mixed.length === 1 ? '' : 's'}</button>
+        <div id="sx-agree-mixed" class="sx-kpi-more sx-agree-mixed${_sxAgreeMixedOpen ? ' open' : ''}">
+            <div>${mixedRows}</div>
+        </div>` : ''}`;
+}
+
+function sxToggleAgreeMixed() {
+    _sxAgreeMixedOpen = !_sxAgreeMixedOpen;
+    const panel = document.getElementById('sx-agree-mixed');
+    const btn = document.querySelector('.sx-agree-toggle');
+    panel?.classList.toggle('open', _sxAgreeMixedOpen);
+    if (btn) {
+        const n = panel ? panel.querySelectorAll('.sx-agree-mixed-row').length : 0;
+        btn.setAttribute('aria-expanded', String(_sxAgreeMixedOpen));
+        btn.textContent = `${_sxAgreeMixedOpen ? 'Hide' : 'Show'} ${n} mixed reading${n === 1 ? '' : 's'}`;
+    }
+}
+
+// ── Money flow ──
+
+function sxRenderFlow() {
+    const box = document.getElementById('sx-flow');
+    if (!box) return;
+    const rows = sxRotationRows();
+    if (!rows.length) {
+        box.innerHTML = '<div class="sx-empty"><b>No rotation data yet</b>Press Refresh to compute where money is rotating.</div>';
+        return;
+    }
+    const maxAbs = Math.max(...rows.map(r => Math.abs(r.flow || 0)), 0.0001);
+    const row = r => {
+        const q = r.quadrant;
+        const moved = r.previous_quadrant && r.previous_quadrant !== q;
+        const angle = r.heading?.angle ?? 0;
+        return `<div class="sx-flow-row" style="--q:${sxColor(q)}" onclick="expandSector(${stEsc(JSON.stringify(r.sector_name))})"
+                    onmouseenter="sxFocus(${stEsc(JSON.stringify(r.sector_name))})" onmouseleave="sxFocus(null)">
+            <span class="sx-arrow" title="Heading ${Math.round(angle)}°"><span style="display:inline-flex;transform:rotate(${-angle}deg)">${SX_ARROW}</span></span>
+            <div style="min-width:0">
+                <div class="sx-flow-name">${stEsc(sxShort(r.sector_name))}</div>
+                <div class="sx-flow-meta">${moved ? `${stEsc(r.previous_quadrant)} → ${sxQChip(q)}` : sxQChip(q)}</div>
+            </div>
+            <div class="sx-flow-bar" title="Rotation score ${(r.flow || 0).toFixed(2)}"><span style="--w:${(Math.abs(r.flow || 0) / maxAbs).toFixed(3)}"></span></div>
+        </div>`;
+    };
+    const inflow = rows.filter(r => r.flow > 0).slice(0, 5);
+    const outflow = rows.filter(r => r.flow < 0).slice(-5).reverse();
+    const group = (title, color, list, empty) => `
+        <div class="sx-flow-group">
+            <h4><i style="background:${color}"></i>${title}</h4>
+            ${list.length ? list.map(row).join('') : `<div class="sx-flow-empty">${empty}</div>`}
+        </div>`;
+    box.innerHTML = group('Rotating in', sxColor('Leading'), inflow, 'No sector gained relative momentum.')
+        + group('Rotating out', sxColor('Lagging'), outflow, 'No sector lost relative momentum.');
+}
+
+// ── Heatmap ──
+
+function sxRenderHeat() {
+    const box = document.getElementById('sx-heat');
+    if (!box) return;
+    const perf = _sxRotation?.performance || [];
+    if (!perf.length) {
+        box.innerHTML = '<div class="sx-empty"><b>No returns yet</b>Returns appear after the next refresh.</div>';
+        return;
+    }
+    const cols = ['1D', '1W', '1M', '3M'];
+    const cap = Object.fromEntries(cols.map(c => [c, Math.max(0.5, ...perf.map(p => Math.abs(p.returns?.[c] ?? 0)))]));
+    const cell = (v, c) => {
+        if (v === null || v === undefined) return '<div class="sx-cell">—</div>';
+        const a = 0.1 + 0.62 * Math.min(1, Math.abs(v) / cap[c]);
+        const bg = v >= 0 ? `rgba(34,197,94,${a.toFixed(3)})` : `rgba(244,63,94,${a.toFixed(3)})`;
+        return `<div class="sx-cell" style="background:${bg}" title="${c}: ${sxPct(v)}">${sxPct(v)}</div>`;
+    };
+    box.innerHTML = `<div class="sx-heat-row"><div class="sx-heat-head">Sector</div>${cols.map(c => `<div class="sx-heat-head">${c}</div>`).join('')}</div>`
+        + perf.map(p => `<div class="sx-heat-row">
+            <div class="sx-heat-name" onclick="expandSector(${stEsc(JSON.stringify(p.sector_name))})">${stEsc(sxShort(p.sector_name))}</div>
+            ${cols.map(c => cell(p.returns?.[c], c)).join('')}
+        </div>`).join('');
+}
+
+// ── Leaderboard ──
+
+function renderSectorsTable(sectors) {
+    const box = document.getElementById('sectors-table');
+    if (!box) return;
+    window._lastSectors = sectors;
+    if (!sectors || !sectors.length) {
+        box.innerHTML = '<div class="sx-empty"><b>No sector data yet</b>Press Refresh to run the sector analysis.</div>';
+        return;
+    }
+    const trendColor = { Strong: 'var(--sx-lead)', Moderate: 'var(--sx-weak)', Weak: 'var(--text-muted)', Bearish: 'var(--sx-lag)' };
+    const bar = (label, v) => {
+        const pct = Math.round((v || 0) * 100);
+        const c = pct >= 65 ? 'var(--sx-lead)' : pct >= 40 ? 'var(--sx-weak)' : 'var(--sx-lag)';
+        return `<span class="sx-bar" title="${label}: ${pct}%"><i style="--h:${pct}%;--c:${c}"></i><em>${label}</em></span>`;
+    };
+    const ring = v => {
+        const pct = Math.max(0, Math.min(100, Math.round((v || 0) * 100)));
+        const r = 18, len = 2 * Math.PI * r;
+        const c = pct >= 60 ? 'var(--sx-lead)' : pct >= 40 ? 'var(--sx-weak)' : 'var(--sx-lag)';
+        return `<svg viewBox="0 0 44 44"><circle class="bg" cx="22" cy="22" r="${r}"/><circle class="fg" cx="22" cy="22" r="${r}" stroke="${c}"
+            stroke-dasharray="${len.toFixed(2)}" stroke-dashoffset="${(len * (1 - pct / 100)).toFixed(2)}"/></svg><span>${pct}</span>`;
+    };
+    const head = `<div class="sx-board-head"><span>#</span><span>Sector</span><span class="sx-hide-sm">Rotation</span>
+        <span class="sx-hide-sm">RS · H D W M</span><span class="sx-hide-sm">Trend</span><span>Score</span><span class="sx-hide-sm">Signals</span></div>`;
+    const rows = sectors.map((s, i) => {
+        const rot = sxRotationOf(s.sector_name);
+        const tags = [
+            s.is_above_20ema ? '<span class="sx-tag">20E</span>' : '',
+            s.is_above_50ema ? '<span class="sx-tag">50E</span>' : '',
+            s.is_making_higher_highs ? '<span class="sx-tag sx-tag--hh">HH</span>' : '',
+        ].join('');
+        const name = JSON.stringify(s.sector_name);
+        return `<div class="sx-board-row${_selectedSector === s.sector_name ? ' is-selected' : ''}" data-name="${stEsc(s.sector_name)}"
+                onclick="expandSector(${stEsc(name)})" onmouseenter="sxFocus(${stEsc(name)})" onmouseleave="sxFocus(null)">
+            <span class="sx-rank">${i + 1}</span>
+            <div class="sx-name"><b>${stEsc(s.sector_name)}</b><small>${stEsc(s.stock_count ?? 0)} stocks ${tags}</small></div>
+            <span class="sx-hide-sm">${rot ? sxQChip(rot.quadrant) : '<span class="sx-flow-empty" style="padding:0">—</span>'}</span>
+            <div class="sx-bars sx-hide-sm">${bar('H', s.hourly_rs ?? s.daily_rs)}${bar('D', s.daily_rs)}${bar('W', s.weekly_rs)}${bar('M', s.monthly_rs)}</div>
+            <div class="sx-trend sx-hide-sm"><span style="color:${trendColor[s.trend] || 'var(--text-muted)'}">${stEsc(s.trend && s.trend !== '—' ? s.trend : '—')}</span>${sxTurnTag(s)}</div>
+            <div class="sx-ring" onmouseenter="sxScoreTip(event, ${i})" onmouseleave="hideScoreTooltip()">${ring(s.combined_score)}</div>
+            <span class="sx-hide-sm" style="justify-self:center">${s.active_signals > 0 ? `<span class="sx-sig">${stEsc(s.active_signals)}</span>` : ''}</span>
+        </div>`;
+    }).join('');
+    box.innerHTML = head + rows;
+}
+
+// The trend label is a level (how the sector has done); the rotation map is a direction.
+// When they disagree, say so: a weak sector gaining on Nifty is "turning up", a strong one
+// losing ground is "cooling". Shown only when Daily and Weekly both agree (one timeframe
+// alone flips too often to be worth flagging).
+const SX_TURN_WEAK = new Set(['Weak', 'Bearish']);
+const SX_TURN_STRONG = new Set(['Strong', 'Moderate']);
+
+function sxTurnOf(s) {
+    const d = sxRotationOf(s.sector_name, 'daily')?.quadrant;
+    const w = sxRotationOf(s.sector_name, 'weekly')?.quadrant;
+    const pick = (qs, kind) => (qs.includes(d) && qs.includes(w)) ? { kind, d, w } : null;
+    if (SX_TURN_WEAK.has(s.trend)) return pick(['Improving', 'Leading'], 'up');
+    if (SX_TURN_STRONG.has(s.trend)) return pick(['Weakening', 'Lagging'], 'down');
+    return null;
+}
+
+function sxTurnTag(s) {
+    const t = sxTurnOf(s);
+    if (!t) return '';
+    const quads = `Daily: ${t.d || '—'}, Weekly: ${t.w || '—'}`;
+    const tip = t.kind === 'up'
+        ? `${s.trend} so far, but relative strength vs Nifty is now rising (${quads}). An early turn: watch it, confirm before acting.`
+        : `${s.trend} so far, but relative strength vs Nifty is now fading (${quads}). Momentum is cooling: tighten stops, be careful adding.`;
+    return `<span class="sx-turn sx-turn--${t.kind}" title="${stEsc(tip)}">`
+        + `${t.kind === 'up' ? '↗ Turning up' : '↘ Cooling'}<small>D + W</small></span>`;
+}
+
+function sxScoreTip(event, index) {
+    const s = _sxSectors[index];
+    if (s) showScoreTooltip(event, s);
+}
+
+// ── Rotation map (SVG) ──
+
+function sxPath(pts) {
+    if (pts.length < 2) return '';
+    let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+    for (let i = 0; i < pts.length - 1; i++) {
+        const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+        const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
+        const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
+        d += ` C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+    }
+    return d;
+}
+
+function sxResample(pts, n) {
+    if (!pts || !pts.length) return null;
+    // Align from the newest point backwards; pad with the oldest point.
+    const out = [];
+    for (let i = 0; i < n; i++) {
+        const src = pts.length - n + i;
+        out.push(pts[Math.max(0, src)].slice());
+    }
+    return out;
+}
+
+function sxRenderRrg(animate) {
+    const svg = document.getElementById('sx-rrg');
+    const wrap = document.getElementById('sx-rrg-wrap');
+    if (!svg || !wrap) return;
+    const W = wrap.clientWidth, H = wrap.clientHeight;
+    if (!W || !H) return;
+    cancelAnimationFrame(_sxAnim);
+    sxBindRrgPointer(svg);
+    sxHoverClear();
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const NS = 'http://www.w3.org/2000/svg';
+    const rows = sxRotationRows();
+
+    if (!rows.length) {
+        svg.innerHTML = `<text class="sx-empty-svg" x="${W / 2}" y="${H / 2}" text-anchor="middle">${
+            _sxRotation ? 'Not enough history for this timeframe yet.' : 'Press Refresh to compute the rotation map.'}</text>`;
+        _sxCur = {};
+        return;
+    }
+
+    // Domain: symmetric around 100 so the quadrants stay centred.
+    let ext = 1.5;
+    rows.forEach(r => r.trail.forEach(p => { ext = Math.max(ext, Math.abs(p.ratio - 100), Math.abs(p.momentum - 100)); }));
+    ext *= 1.14;
+    const pad = { l: 46, r: 18, t: 16, b: 36 };
+    const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+    const X = v => pad.l + ((v - (100 - ext)) / (2 * ext)) * iw;
+    const Y = v => pad.t + (1 - (v - (100 - ext)) / (2 * ext)) * ih;
+    const cx = X(100), cy = Y(100);
+
+    // Static layer: quadrant tints, grid, axes, labels.
+    const quad = (x, y, w, h, q, lx, ly, anchor) => `
+        <rect class="sx-q-bg" x="${x}" y="${y}" width="${w}" height="${h}" fill="${sxColor(q)}" fill-opacity="0.07"/>
+        <text class="sx-q-label" x="${lx}" y="${ly}" text-anchor="${anchor}" fill="${sxColor(q)}" fill-opacity="0.75">${q}</text>`;
+    let stat = quad(cx, pad.t, pad.l + iw - cx, cy - pad.t, 'Leading', pad.l + iw - 10, pad.t + 18, 'end')
+        + quad(cx, cy, pad.l + iw - cx, pad.t + ih - cy, 'Weakening', pad.l + iw - 10, pad.t + ih - 10, 'end')
+        + quad(pad.l, cy, cx - pad.l, pad.t + ih - cy, 'Lagging', pad.l + 10, pad.t + ih - 10, 'start')
+        + quad(pad.l, pad.t, cx - pad.l, cy - pad.t, 'Improving', pad.l + 10, pad.t + 18, 'start');
+    const step = ext > 6 ? 2 : ext > 3 ? 1 : 0.5;
+    for (let v = Math.ceil((100 - ext) / step) * step; v <= 100 + ext; v += step) {
+        if (Math.abs(v - 100) < 1e-9) continue;
+        stat += `<line class="sx-grid-line" x1="${X(v)}" y1="${pad.t}" x2="${X(v)}" y2="${pad.t + ih}"/>
+                 <line class="sx-grid-line" x1="${pad.l}" y1="${Y(v)}" x2="${pad.l + iw}" y2="${Y(v)}"/>
+                 <text class="sx-tick" x="${X(v)}" y="${pad.t + ih + 14}" text-anchor="middle">${+v.toFixed(1)}</text>
+                 <text class="sx-tick" x="${pad.l - 6}" y="${Y(v) + 3}" text-anchor="end">${+v.toFixed(1)}</text>`;
+    }
+    stat += `<line class="sx-axis" x1="${cx}" y1="${pad.t}" x2="${cx}" y2="${pad.t + ih}"/>
+             <line class="sx-axis" x1="${pad.l}" y1="${cy}" x2="${pad.l + iw}" y2="${cy}"/>
+             <text class="sx-axis-title" x="${pad.l + iw / 2}" y="${H - 4}" text-anchor="middle">RS-Ratio →</text>
+             <text class="sx-axis-title" transform="translate(12 ${pad.t + ih / 2}) rotate(-90)" text-anchor="middle">RS-Momentum →</text>`;
+
+    svg.innerHTML = `<defs></defs><g>${stat}</g><g id="sx-series-layer"></g>`;
+    const defs = svg.querySelector('defs');
+    const layer = svg.querySelector('#sx-series-layer');
+
+    // Series: target points, starting points (current animation state or the centre).
+    const series = rows.map((r, i) => {
+        const target = r.trail.map(p => [p.ratio, p.momentum]);
+        const start = animate
+            ? (sxResample(_sxCur[r.sector_name], target.length) || target.map(() => [100, 100]))
+            : target.map(p => p.slice());
+        const color = sxColor(r.quadrant);
+        const id = `sxg-${i}`;
+        const grad = document.createElementNS(NS, 'linearGradient');
+        grad.setAttribute('id', id);
+        grad.setAttribute('gradientUnits', 'userSpaceOnUse');
+        grad.innerHTML = `<stop offset="0" stop-color="${color}" stop-opacity="0.04"/><stop offset="1" stop-color="${color}" stop-opacity="0.95"/>`;
+        defs.appendChild(grad);
+
+        const g = document.createElementNS(NS, 'g');
+        g.setAttribute('class', `sx-series${_sxFocusName === r.sector_name ? ' is-focus' : ''}`);
+        g.dataset.name = r.sector_name;
+        g.innerHTML = `<path class="sx-tail" stroke="url(#${id})"/>
+            ${target.slice(0, -1).map((_, k) => `<circle class="sx-tail-dot" r="${(1.4 + 1.6 * k / target.length).toFixed(2)}" fill="${color}" fill-opacity="${(0.15 + 0.6 * k / target.length).toFixed(2)}"/>`).join('')}
+            <circle class="sx-halo" r="11" fill="${color}"/>
+            <circle class="sx-head" r="5.5" fill="${color}"/>
+            <text class="sx-label">${stEsc(sxShort(r.sector_name))}</text>`;
+        layer.appendChild(g);
+        return { r, g, grad, start, target, delay: animate ? i * 28 : 0,
+                 path: g.querySelector('.sx-tail'), dots: g.querySelectorAll('.sx-tail-dot'),
+                 halo: g.querySelector('.sx-halo'), head: g.querySelector('.sx-head'), label: g.querySelector('.sx-label') };
+    });
+    if (_sxFocusName) svg.classList.add('has-focus'); else svg.classList.remove('has-focus');
+
+    const duration = animate ? 1100 : 0;
+    const t0 = performance.now();
+    const frame = now => {
+        let running = false;
+        for (const s of series) {
+            const local = duration ? Math.min(1, Math.max(0, (now - t0 - s.delay) / duration)) : 1;
+            if (local < 1) running = true;
+            const k = sxEase(local);
+            const pts = s.target.map((p, j) => [s.start[j][0] + (p[0] - s.start[j][0]) * k, s.start[j][1] + (p[1] - s.start[j][1]) * k]);
+            _sxCur[s.r.sector_name] = pts;
+            const px = pts.map(p => [X(p[0]), Y(p[1])]);
+            const first = px[0], last = px[px.length - 1];
+            s.path.setAttribute('d', sxPath(px));
+            s.grad.setAttribute('x1', first[0]); s.grad.setAttribute('y1', first[1]);
+            s.grad.setAttribute('x2', last[0] + 0.01); s.grad.setAttribute('y2', last[1] + 0.01);
+            s.dots.forEach((d, j) => { d.setAttribute('cx', px[j][0]); d.setAttribute('cy', px[j][1]); });
+            s.head.setAttribute('cx', last[0]); s.head.setAttribute('cy', last[1]);
+            s.halo.setAttribute('cx', last[0]); s.halo.setAttribute('cy', last[1]);
+            s.lastPx = last;
+        }
+        // Labels: second pass so every dot counts as an obstacle, not just earlier labels.
+        const heads = series.map(s => s.lastPx);
+        const placed = heads.map(h => [h[0] - 7, h[1] - 7, 14, 14]);
+        const cands = [[9, -8, 'start'], [9, 15, 'start'], [-9, -8, 'end'], [-9, 15, 'end'], [9, 27, 'start'], [-9, -20, 'end']];
+        for (const s of series) {
+            const last = s.lastPx;
+            const wLab = 6.6 * sxShort(s.r.sector_name).length + 8;
+            let pick = null;
+            for (const c of cands) {
+                const bx = c[2] === 'start' ? last[0] + c[0] : last[0] + c[0] - wLab;
+                const by = last[1] + c[1] - 11;
+                const hit = placed.some(b => bx < b[0] + b[2] && bx + wLab > b[0] && by < b[1] + b[3] && by + 14 > b[1]
+                    && !(b[2] === 14 && Math.abs(b[0] + 7 - last[0]) < 0.5 && Math.abs(b[1] + 7 - last[1]) < 0.5));
+                if (!hit) { pick = c; placed.push([bx, by, wLab, 14]); break; }
+            }
+            // No free spot: hide the label in the crowd (it shows on hover/focus).
+            s.label.classList.toggle('sx-label--crowded', !pick);
+            pick = pick || cands[0];
+            s.label.setAttribute('x', last[0] + pick[0]);
+            s.label.setAttribute('y', last[1] + pick[1]);
+            s.label.setAttribute('text-anchor', pick[2]);
+        }
+        if (running) _sxAnim = requestAnimationFrame(frame);
+    };
+    _sxAnim = requestAnimationFrame(frame);
+}
+
+/*
+ * Hover on the map uses one set of delegated pointer listeners on the <svg>
+ * instead of per-sector mouseenter/mouseleave. sxFocus() re-appends the hovered
+ * group to draw it on top, and moving a node under the pointer suppresses its
+ * mouseleave, which used to leave the tooltip stuck on screen.
+ */
+let _sxHoverName = null;
+
+function sxBindRrgPointer(svg) {
+    if (svg.dataset.bound) return;
+    svg.dataset.bound = '1';
+    const track = e => {
+        const g = e.target.closest?.('.sx-series');
+        const name = g ? g.dataset.name : null;
+        if (name === _sxHoverName) return;
+        if (!name) { sxHoverClear(); return; }
+        const r = sxRotationOf(name);
+        if (!r) { sxHoverClear(); return; }
+        _sxHoverName = name;
+        sxFocus(name);
+        sxShowTip(r);
+    };
+    svg.addEventListener('pointerover', track);
+    svg.addEventListener('pointermove', track);
+    svg.addEventListener('pointerleave', sxHoverClear);
+    svg.addEventListener('click', e => {
+        const g = e.target.closest?.('.sx-series');
+        if (g) expandSector(g.dataset.name);
+    });
+}
+
+function sxHoverClear() {
+    if (_sxHoverName === null && !document.getElementById('sx-rrg-tip')?.classList.contains('show')) return;
+    _sxHoverName = null;
+    sxFocus(null);
+    sxHideTip();
+}
+
+function sxFocus(name) {
+    _sxFocusName = name;
+    const svg = document.getElementById('sx-rrg');
+    if (!svg) return;
+    svg.classList.toggle('has-focus', !!name);
+    svg.querySelectorAll('.sx-series').forEach(g => g.classList.toggle('is-focus', g.dataset.name === name));
+    // Bring the focused series to the front.
+    if (name) {
+        const g = [...svg.querySelectorAll('.sx-series')].find(el => el.dataset.name === name);
+        if (g) g.parentNode.appendChild(g);
+    }
+}
+
+function sxShowTip(r) {
+    const tip = document.getElementById('sx-rrg-tip');
+    const wrap = document.getElementById('sx-rrg-wrap');
+    const svg = document.getElementById('sx-rrg');
+    const head = [...svg.querySelectorAll('.sx-series')].find(g => g.dataset.name === r.sector_name)?.querySelector('.sx-head');
+    if (!tip || !wrap || !head) return;
+    const last = r.trail[r.trail.length - 1];
+    const ret = sxReturnsOf(r.sector_name);
+    const moved = r.previous_quadrant && r.previous_quadrant !== r.quadrant;
+    tip.innerHTML = `
+        <div class="sx-tip-title">${stEsc(r.sector_name)} ${sxQChip(r.quadrant)}</div>
+        ${moved ? `<div class="sx-tip-row"><span>Moved from</span><b>${stEsc(r.previous_quadrant)}</b></div>` : ''}
+        <div class="sx-tip-row"><span>RS-Ratio</span><b>${last.ratio.toFixed(2)}</b></div>
+        <div class="sx-tip-row"><span>RS-Momentum</span><b>${last.momentum.toFixed(2)}</b></div>
+        <div class="sx-tip-row"><span>Speed</span><b>${(r.heading?.speed ?? 0).toFixed(2)}</b></div>
+        <div class="sx-tip-row"><span>1W / 1M</span><b>${sxPct(ret['1W'])} / ${sxPct(ret['1M'])}</b></div>`;
+    const svgBox = svg.getBoundingClientRect();
+    const scale = svgBox.width / (svg.viewBox.baseVal.width || svgBox.width);
+    const hx = (+head.getAttribute('cx')) * scale, hy = (+head.getAttribute('cy')) * scale;
+    const tw = 210, th = 140;
+    const left = hx + 16 + tw > wrap.clientWidth ? hx - tw - 16 : hx + 16;
+    const top = Math.min(Math.max(8, hy - th / 2), wrap.clientHeight - th - 8);
+    tip.style.left = `${Math.max(8, left)}px`;
+    tip.style.top = `${top}px`;
+    tip.classList.add('show');
+}
+
+function sxHideTip() {
+    document.getElementById('sx-rrg-tip')?.classList.remove('show');
+}
+
+// ── Detail drawer ──
+
+async function expandSector(sectorName) {
+    sxDrawerMsg('');
+    _selectedSector = sectorName;
+    document.querySelectorAll('#sectors-table .sx-board-row').forEach(r =>
+        r.classList.toggle('is-selected', r.dataset.name === sectorName));
+
+    const panel = document.getElementById('sector-stocks-panel');
+    const listEl = document.getElementById('sector-stocks-list');
+    const s = _sxSectors.find(x => x.sector_name === sectorName) || {};
+    const rot = sxRotationOf(sectorName);
+    const ret = sxReturnsOf(sectorName);
+
+    document.getElementById('sector-stocks-title').textContent = sectorName;
+    document.getElementById('sx-drawer-tags').innerHTML = [
+        rot ? sxQChip(rot.quadrant, `${rot.quadrant} · ${_sxTf}`) : '',
+        s.trend && s.trend !== '—' ? `<span class="sx-chip">${stEsc(s.trend)} trend</span>` : '',
+        s.active_signals ? `<span class="sx-chip">${stEsc(s.active_signals)} active signals</span>` : '',
+    ].join('');
+    const pct = v => (v === null || v === undefined) ? '—' : `${Math.round(v * 100)}%`;
+    document.getElementById('sx-drawer-stats').innerHTML = [
+        ['Score', pct(s.combined_score)],
+        ['Rel. strength', pct(s.relative_strength)],
+        ['1 week', sxPct(ret['1W'])],
+        ['1 month', sxPct(ret['1M'])],
+    ].map(([k, v]) => `<div class="sx-stat"><span>${k}</span><b>${stEsc(v)}</b></div>`).join('');
+
+    panel.classList.add('open');
+    panel.setAttribute('aria-hidden', 'false');
+    document.getElementById('sx-scrim').classList.add('open');
+    listEl.innerHTML = '<div class="sx-empty"><span class="spinner"></span></div>';
+    requestAnimationFrame(() => loadSectorChart(sectorName));
+
+    try {
+        const response = await fetch(`${API_BASE}/api/settings/sectors/${encodeURIComponent(sectorName)}/stocks`);
+        const data = await response.json();
+        if (_selectedSector !== sectorName) return;
+        _sxStocks = data && Array.isArray(data.stocks) ? data : { stocks: Array.isArray(data) ? data : [] };
+        sxRenderStocks();
+    } catch (err) {
+        listEl.innerHTML = `<div class="sx-empty">Could not load stocks: ${stEsc(err.message)}</div>`;
+    }
+}
+
+let _sxStocks = null;          // last /sectors/{name}/stocks payload
+let _sxStocksFnoOnly = false;  // "F&O only" filter in the sector panel
+
+function sxSetStocksFilter(fnoOnly) {
+    _sxStocksFnoOnly = !!fnoOnly;
+    sxRenderStocks();
+}
+
+function sxRenderStocks() {
+    const listEl = document.getElementById('sector-stocks-list');
+    if (!listEl || !_sxStocks) return;
+    const all = _sxStocks.stocks || [];
+    if (!all.length) {
+        listEl.innerHTML = '<div class="sx-empty">No constituents listed for this sector.</div>';
+        return;
+    }
+    const fnoCount = all.filter(st => st.is_fno).length;
+    const shown = _sxStocksFnoOnly ? all.filter(st => st.is_fno) : all;
+    const asOf = _sxStocks.as_of
+        ? `NSE list as of ${new Date(_sxStocks.as_of + 'T00:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
+        : 'NSE list';
+    const head = `<div class="sx-stocks-head">
+        <span><b>${all.length}</b> stocks · <b>${fnoCount}</b> in F&amp;O · ${stEsc(asOf)}</span>
+        <span class="sx-seg sx-seg--sm" role="tablist">
+            <button type="button" class="${_sxStocksFnoOnly ? '' : 'active'}" onclick="sxSetStocksFilter(false)">All</button>
+            <button type="button" class="${_sxStocksFnoOnly ? 'active' : ''}" onclick="sxSetStocksFilter(true)">F&amp;O only</button>
+        </span>
+    </div>`;
+    const rows = shown.map(st => {
+        const sig = st.has_signal
+            ? `<span class="sx-sig">${st.signal_type === 'explosion' ? 'BREAKOUT' : 'VCP'} ${Math.round((st.signal_score || 0) * 100)}%</span>` : '';
+        const occ = st.occurrence_number > 1 ? `<span class="sx-chip">${stEsc(ordinal(st.occurrence_number))} time</span>` : '';
+        const fno = !st.in_dhan
+            ? '<span class="sx-chip sx-chip--warn" title="This constituent was not found in the Dhan instrument list. Refresh Instruments in Settings.">Not on Dhan</span>'
+            : st.is_fno
+                ? `<span class="sx-chip sx-chip--fno">F&amp;O${st.lot_size > 1 ? ` · lot ${stEsc(st.lot_size)}` : ''}</span>`
+                : '<span class="sx-chip sx-chip--muted" title="Index constituent without F&amp;O contracts (cash market only)">No F&amp;O</span>';
+        return `<div class="sx-stock${st.is_fno ? '' : ' sx-stock--cash'}">
+            <div style="min-width:0"><b>${stEsc(st.symbol)}</b><small>${stEsc(st.display_name || st.company || '')}</small></div>
+            <div class="sx-stock-tags">${occ}${fno}${sig}</div>
+        </div>`;
+    }).join('');
+    listEl.innerHTML = head + (rows || '<div class="sx-empty">No F&amp;O stocks in this index.</div>');
+}
+
+function closeSectorStocks() {
+    sxDrawerMsg('');
+    _selectedSector = null;
+    const panel = document.getElementById('sector-stocks-panel');
+    panel?.classList.remove('open');
+    panel?.setAttribute('aria-hidden', 'true');
+    document.getElementById('sx-scrim')?.classList.remove('open');
+    document.querySelectorAll('#sectors-table .sx-board-row.is-selected').forEach(r => r.classList.remove('is-selected'));
+}
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && _selectedSector) closeSectorStocks();
+});
+
+// ── Refresh / Telegram ──
+
+async function runSectorAnalysisFromTab() {
+    const btn = document.getElementById('btn-refresh-sectors');
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Analyzing…';
+    sxStatus('Analyzing sectors and themes…');
+    try {
+        const response = await fetch(`${API_BASE}/api/settings/scan/sectors`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.detail || `HTTP ${response.status}`);
+        await loadSectorsTab();
+        sxStatus(`Refreshed ${data.sectors?.length ?? _sxSectors.length} sectors`, 'ok');
+        if (_sectorTelegramOnRefresh) {
+            sxStatus('Refreshed · sending Telegram…');
+            try {
+                const notify = await notifySectorReportToTelegram();
+                sxStatus(`Refreshed + Telegram sent${notify?.telegram?.message_id ? ` (#${notify.telegram.message_id})` : ''}`, 'ok');
+            } catch (err) {
+                sxStatus(`Refreshed, Telegram failed: ${err.message}`, 'err');
+            }
+        }
+    } catch (err) {
+        console.error('Sector analysis failed:', err);
+        sxStatus(`Refresh failed: ${err.message}`, 'err');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = original;
+    }
+}
+
+async function sendSectorReportToTelegram() {
+    if (!isAdminUser()) return;
+    sxStatus('Sending Telegram report…');
+    try {
+        const notify = await notifySectorReportToTelegram();
+        sxStatus(`Telegram sent${notify?.telegram?.message_id ? ` (#${notify.telegram.message_id})` : ''}`, 'ok');
+    } catch (err) {
+        sxStatus(`Telegram send failed: ${err.message}`, 'err');
+    }
+}
+
+// ── Sector detail: "Open in Dhan" → TradingView on Dhan in a new tab ──
+
+const SX_DHAN_TV_URL = 'https://tv.dhan.co/';
+
+function sxDrawerMsg(text, kind) {
+    const el = document.getElementById('sx-drawer-msg');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = `sx-drawer-msg${kind ? ` sx-drawer-msg--${kind}` : ''}`;
+    el.hidden = !text;
+}
+
+/** Open in a new tab; returns false if a pop-up blocker stopped it. */
+function sxOpenTab(url) {
+    // Not using the "noopener" feature: with it window.open() always returns null,
+    // which would hide a blocked pop-up. Cutting the opener link gives the same isolation.
+    const win = window.open(url, '_blank');
+    if (!win) return false;
+    try { win.opener = null; } catch (_) { /* cross-origin: already isolated */ }
+    return true;
+}
+
+/**
+ * tv.dhan.co has no documented link to a specific symbol, so copy the sector
+ * name (to paste into its symbol search) and open it in a new tab.
+ */
+async function sxOpenInDhan() {
+    const name = _selectedSector;
+    if (!name) return;
+    // Start the clipboard write while this tab still has focus, then open synchronously
+    // inside the click so the browser treats the new tab as user-initiated.
+    const copy = navigator.clipboard?.writeText(name).then(() => true, () => false) ?? Promise.resolve(false);
+    const ok = sxOpenTab(SX_DHAN_TV_URL);
+    const copied = await copy;
+    if (!ok) {
+        sxDrawerMsg('Your browser blocked the new tab. Allow pop-ups for this site, then try again.', 'err');
+    } else {
+        sxDrawerMsg(copied
+            ? `Opened TradingView on Dhan. "${name}" is copied: paste it into the symbol search.`
+            : `Opened TradingView on Dhan. Search for "${name}" there.`, 'ok');
+    }
+}
+
+// ── IPOs tab: last 5 years of main-board IPOs vs their all-time high ──
+
+const IPO_BAND_KEY = 'ipo-band-filter';
+let _ipo = null;                 // /api/ipos payload
+let _ipoYear = 'all';
+let _ipoBand = (() => { try { return localStorage.getItem(IPO_BAND_KEY) || 'all'; } catch (_) { return 'all'; } })();
+let _ipoSort = { key: 'listing_date', dir: -1 };
+let _ipoPoll = 0;
+
+const ipoPct = v => (v === null || v === undefined) ? '—' : `${v > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+const ipoCls = v => (v === null || v === undefined) ? '' : v >= 0 ? 'ipo-up' : 'ipo-down';
+const ipoMoney = v => (v === null || v === undefined) ? '—' : `₹${Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+const ipoDate = s => {
+    if (!s) return '—';
+    const d = new Date(`${s}T00:00:00`);
+    return Number.isNaN(d.getTime()) ? s : d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+};
+const ipoInBand = (r, band) => band === 'all' || (band === 'at_ath' ? r.band === 'at_ath' : (r.band === 'at_ath' || r.band === 'near'));
+
+async function loadIposTab() {
+    const root = document.getElementById('content-ipos');
+    try {
+        const res = await fetch(`${API_BASE}/api/ipos`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        _ipo = await res.json();
+    } catch (e) {
+        _ipo = null;
+        ipoStatus(`Could not load IPOs: ${e.message}`, 'err');
+    }
+    ipoRenderAll();
+    root?.classList.remove('sx-in');
+    void root?.offsetWidth;
+    requestAnimationFrame(() => root?.classList.add('sx-in'));
+    if (_ipo?.status?.running) ipoStartPolling();
+}
+
+function ipoStatus(text, kind) {
+    const el = document.getElementById('ipo-status');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = `sx-status${kind ? ` sx-status--${kind}` : ''}`;
+}
+
+function ipoRenderAll() {
+    const asof = document.getElementById('ipo-asof');
+    if (asof && _ipo?.available) {
+        asof.textContent = `Main-board IPOs listed on NSE since ${ipoDate(_ipo.since)} · prices as of ${ipoDate(_ipo.as_of)}`
+            + (_ipo.list_error ? ' · NSE list could not be refreshed, showing the previous one' : '');
+    }
+    ipoSyncBand();
+    ipoRenderYears();
+    ipoRender();
+}
+
+function ipoRows() { return _ipo?.ipos || []; }
+
+function ipoRenderYears() {
+    const box = document.getElementById('ipo-years');
+    if (!box) return;
+    const rows = ipoRows();
+    if (!rows.length) { box.innerHTML = ''; return; }
+    const years = [...new Set(rows.map(r => r.listing_date.slice(0, 4)))].sort().reverse();
+    const tile = (key, label, list, hint) => {
+        const at = list.filter(r => r.band === 'at_ath').length;
+        const near = list.filter(r => r.band === 'at_ath' || r.band === 'near').length;
+        return `<button type="button" class="ipo-year${_ipoYear === key ? ' is-active' : ''}" onclick="ipoSetYear('${key}')"
+                aria-pressed="${_ipoYear === key}">
+            <span class="ipo-year-label">${stEsc(label)}</span>
+            <span class="ipo-year-count">${list.length}</span>
+            <span class="ipo-year-hint">${stEsc(hint)}</span>
+            <span class="ipo-year-stats"><i class="ipo-dot ipo-dot--at"></i>${at} at ATH <i class="ipo-dot ipo-dot--near"></i>${near} &lt;15%</span>
+        </button>`;
+    };
+    const since = _ipo?.since ? `since ${ipoDate(_ipo.since)}` : 'since Nov 2021';
+    box.innerHTML = tile('all', 'All years', rows, since)
+        + years.map(y => {
+            const list = rows.filter(r => r.listing_date.startsWith(y));
+            const partial = _ipo?.since && y === _ipo.since.slice(0, 4) ? `from ${ipoDate(_ipo.since)}` : y === String(new Date().getFullYear()) ? 'year to date' : 'listed';
+            return tile(y, y, list, partial);
+        }).join('');
+}
+
+function ipoSetYear(y) {
+    _ipoYear = y;
+    ipoRenderYears();
+    ipoRender();
+}
+
+function ipoSetBand(b) {
+    _ipoBand = b;
+    try { localStorage.setItem(IPO_BAND_KEY, b); } catch (_) { /* ignore */ }
+    ipoSyncBand();
+    ipoRender();
+}
+
+function ipoSyncBand() {
+    const seg = document.getElementById('ipo-band');
+    if (!seg) return;
+    let active = null;
+    seg.querySelectorAll('button').forEach(b => {
+        const on = b.dataset.band === _ipoBand;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', String(on));
+        if (on) active = b;
+    });
+    const ink = seg.querySelector('.sx-seg-ink');
+    if (ink && active) {
+        ink.style.width = `${active.offsetWidth}px`;
+        ink.style.transform = `translateX(${active.offsetLeft}px)`;
+    }
+}
+
+function ipoSortBy(key) {
+    _ipoSort = _ipoSort.key === key ? { key, dir: -_ipoSort.dir } : { key, dir: key === 'symbol' ? 1 : -1 };
+    ipoRender();
+}
+
+function ipoRender() {
+    const box = document.getElementById('ipo-table');
+    const count = document.getElementById('ipo-count');
+    if (!box) return;
+    const all = ipoRows();
+    if (!all.length) {
+        const running = _ipo?.status?.running;
+        box.innerHTML = `<div class="sx-empty"><b>${running ? 'Building the IPO list…' : 'No IPO data yet'}</b>${running
+            ? 'Loading price history for every IPO. The first build takes several minutes; later refreshes are quick.'
+            : 'Press Refresh to download NSE\'s IPO list and work out each stock\'s all-time high from Dhan.'}</div>`;
+        if (count) count.textContent = '';
+        return;
+    }
+    const q = (document.getElementById('ipo-search')?.value || '').trim().toLowerCase();
+    const fnoOnly = document.getElementById('ipo-fno')?.checked;
+    let rows = all.filter(r => (_ipoYear === 'all' || r.listing_date.startsWith(_ipoYear))
+        && ipoInBand(r, _ipoBand)
+        && (!fnoOnly || r.is_fno)
+        && (!q || r.symbol.toLowerCase().includes(q) || (r.company || '').toLowerCase().includes(q)
+            || (r.dhan_symbol || '').toLowerCase().includes(q)));
+    const { key, dir } = _ipoSort;
+    rows = rows.slice().sort((a, b) => {
+        const x = a[key], y = b[key];
+        if (x === y) return 0;
+        if (x === null || x === undefined) return 1;
+        if (y === null || y === undefined) return -1;
+        return (x > y ? 1 : -1) * dir;
+    });
+    if (count) count.textContent = `${rows.length} of ${all.length}`;
+    const th = (k, label, cls = '') => `<button type="button" class="ipo-th ${cls}${key === k ? ' is-sorted' : ''}" onclick="ipoSortBy('${k}')">${label}${key === k ? (dir > 0 ? ' ↑' : ' ↓') : ''}</button>`;
+    const head = `<div class="ipo-row ipo-head">${th('symbol', 'Stock')}${th('listing_date', 'Listed')}${th('issue_price', 'Issue', 'ipo-num ipo-hide-sm')}
+        ${th('listing_gain_pct', 'Listing', 'ipo-num ipo-hide-sm')}${th('close', 'Close', 'ipo-num')}${th('since_issue_pct', 'Since IPO', 'ipo-num ipo-hide-sm')}
+        ${th('ath', 'ATH', 'ipo-num ipo-hide-sm')}${th('from_ath_pct', 'From ATH', 'ipo-num')}</div>`;
+    if (!rows.length) {
+        box.innerHTML = head + '<div class="sx-empty"><b>No IPOs match</b>Try another year or a wider ATH filter.</div>';
+        return;
+    }
+    const body = rows.map(r => {
+        const off = r.from_ath_pct;
+        const fill = off === null || off === undefined ? 0 : Math.max(0, Math.min(100, 100 + off));
+        const bandCls = r.band === 'at_ath' ? 'ipo-band--at' : r.band === 'near' ? 'ipo-band--near' : 'ipo-band--below';
+        const tags = [
+            r.band === 'at_ath' ? '<span class="ipo-tag ipo-tag--at">At ATH</span>' : '',
+            r.is_fno ? `<span class="sx-tag" title="Lot size ${stEsc(r.lot_size ?? '')}">F&amp;O</span>` : '',
+            r.in_dhan ? '' : '<span class="ipo-tag ipo-tag--muted">Not on Dhan</span>',
+        ].join('');
+        const sym = r.dhan_symbol || r.symbol;
+        return `<div class="ipo-row${r.in_dhan ? '' : ' is-missing'}" role="button" tabindex="0" data-sym="${stEsc(sym)}"
+                onclick="ipoOpenInDhan(this.dataset.sym)" onkeydown="if(event.key==='Enter')ipoOpenInDhan(this.dataset.sym)"
+                title="Open TradingView on Dhan (copies ${stEsc(sym)})">
+            <div class="ipo-name"><b>${stEsc(sym)} ${tags}</b><small>${stEsc(r.company || r.display_name || '')}</small></div>
+            <span class="ipo-date">${stEsc(ipoDate(r.listing_date))}</span>
+            <span class="ipo-num ipo-hide-sm">${stEsc(ipoMoney(r.issue_price))}</span>
+            <span class="ipo-num ipo-hide-sm ${ipoCls(r.listing_gain_pct)}">${stEsc(ipoPct(r.listing_gain_pct))}</span>
+            <span class="ipo-num">${stEsc(ipoMoney(r.close))}</span>
+            <span class="ipo-num ipo-hide-sm ${ipoCls(r.since_issue_pct)}">${stEsc(ipoPct(r.since_issue_pct))}</span>
+            <span class="ipo-num ipo-hide-sm"><span>${stEsc(ipoMoney(r.ath))}</span><small>${stEsc(r.ath_date ? ipoDate(r.ath_date) : '')}</small></span>
+            <span class="ipo-num ipo-ath ${bandCls}"><span>${stEsc(off === null || off === undefined ? '—' : `${Number(off).toFixed(1)}%`)}</span>
+                <i class="ipo-meter"><i style="--w:${fill.toFixed(1)}%"></i></i></span>
+        </div>`;
+    }).join('');
+    box.innerHTML = head + body;
+}
+
+async function ipoOpenInDhan(sym) {
+    if (!sym) return;
+    const copy = navigator.clipboard?.writeText(sym).then(() => true, () => false) ?? Promise.resolve(false);
+    const ok = sxOpenTab(SX_DHAN_TV_URL);
+    const copied = await copy;
+    if (!ok) ipoStatus('Your browser blocked the new tab. Allow pop-ups for this site.', 'err');
+    else ipoStatus(copied ? `Opened TradingView on Dhan · "${sym}" copied, paste it into the symbol search.` : `Opened TradingView on Dhan · search for "${sym}".`, 'ok');
+}
+
+async function ipoRefresh() {
+    const btn = document.getElementById('btn-ipo-refresh');
+    if (btn) btn.disabled = true;
+    try {
+        const res = await fetch(`${API_BASE}/api/ipos/refresh`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`);
+        ipoStatus(data.started ? 'Refreshing…' : (data.detail || 'A refresh is already running'));
+        ipoStartPolling();
+    } catch (e) {
+        ipoStatus(`Refresh failed: ${e.message}`, 'err');
+        if (btn) btn.disabled = false;
+    }
+}
+
+function ipoStartPolling() {
+    clearTimeout(_ipoPoll);
+    const btn = document.getElementById('btn-ipo-refresh');
+    if (btn) btn.disabled = true;
+    const tick = async () => {
+        let st = null;
+        try { st = await (await fetch(`${API_BASE}/api/ipos/status`)).json(); } catch (_) { /* retry */ }
+        if (st?.running) {
+            ipoStatus(st.phase === 'prices' && st.total
+                ? `Updating prices ${st.done}/${st.total}…`
+                : 'Downloading the IPO list from NSE…');
+            _ipoPoll = setTimeout(tick, 2000);
+            return;
+        }
+        if (btn) btn.disabled = false;
+        if (st?.error) { ipoStatus(`Refresh failed: ${st.error}`, 'err'); return; }
+        const s = st?.summary;
+        await loadIposTab();
+        ipoStatus(s ? `Updated ${s.ipos} IPOs · ${s.at_ath} at ATH · ${s.near_ath} within 15%`
+            + (s.price_failures ? ` · ${s.price_failures} price lookups failed` : '') : 'Updated', s?.price_failures ? '' : 'ok');
+    };
+    _ipoPoll = setTimeout(tick, 1200);
+}
+
+// ── Sectors tab: per-panel info popovers + full "How to read" guide ──
+// Content is static (no user data), so it is inserted as trusted HTML.
+
+const SX_HELP = {
+    'q-Leading': {
+        title: 'Leading',
+        body: `<p><b>Beating Nifty 50, and the lead is still growing.</b> RS-Ratio &gt; 100 and RS-Momentum &gt; 100.</p>
+            <p>This is where relative strength is concentrated right now. On the usual clockwise cycle, the next stop is <b>Weakening</b>: still ahead of Nifty, but losing momentum.</p>`,
+    },
+    'q-Improving': {
+        title: 'Improving',
+        body: `<p><b>Still behind Nifty 50, but catching up.</b> RS-Ratio &lt; 100 and RS-Momentum &gt; 100.</p>
+            <p>Early recoveries. If the catch-up continues, these cross into <b>Leading</b>. Some turn back down into Lagging instead, so treat this as "worth watching", not "already strong".</p>`,
+    },
+    'q-Weakening': {
+        title: 'Weakening',
+        body: `<p><b>Still beating Nifty 50, but the lead is shrinking.</b> RS-Ratio &gt; 100 and RS-Momentum &lt; 100.</p>
+            <p>Often the first warning that a leader is fading. Next stop on the cycle is usually <b>Lagging</b>, though a sector can re-accelerate back into Leading.</p>`,
+    },
+    'q-Lagging': {
+        title: 'Lagging',
+        body: `<p><b>Behind Nifty 50, and falling further behind.</b> RS-Ratio &lt; 100 and RS-Momentum &lt; 100.</p>
+            <p>Relative strength has left these sectors. The first sign of a turn is a move up into <b>Improving</b>.</p>`,
+    },
+    agree: {
+        title: 'Confirmed on Daily & Weekly',
+        body: `<p>Sectors in the <b>same quadrant on both</b> timeframes, so you don't have to compare Daily and Weekly by hand. It always uses both, whichever way the map's toggle is set.</p>
+            <ul>
+                <li><b>Leading on both</b>: short- and longer-term strength agree, the firmest strength reading.</li>
+                <li><b>Improving on both</b>: the catch-up shows on both timeframes.</li>
+                <li><b>Weakening / Lagging on both</b>: weakness confirmed on both.</li>
+                <li>Within each group, the strongest readings (furthest from the centre of the map) come first.</li>
+            </ul>
+            <p><b>Mixed readings</b> are sectors whose timeframes disagree, e.g. Daily Leading but Weekly Lagging: often a short-term move against the longer trend, or an early turn. Treat them as less certain.</p>`,
+    },
+    map: {
+        title: 'Rotation map',
+        body: `<p>Every Nifty sector index plotted against Nifty 50 (a Relative Rotation Graph).</p>
+            <ul>
+                <li><b>Horizontal: RS-Ratio.</b> Right of 100 = beating Nifty; left = trailing it.</li>
+                <li><b>Vertical: RS-Momentum.</b> Above 100 = that relative strength is improving; below = deteriorating.</li>
+                <li><b>Dot</b> = latest reading. <b>Tail</b> = the recent path, fading into the past (10 days on Daily, 8 weeks on Weekly).</li>
+                <li>Distance from the centre = how strong the reading is. Dots near the centre lines can switch quadrant on a small move.</li>
+            </ul>
+            <p><b>Daily</b> shows short-term rotation; <b>Weekly</b> shows the bigger trend. Hover a dot for its numbers, click it for details. Crowded labels hide until you hover.</p>`,
+    },
+    flow: {
+        title: 'Money flow',
+        body: `<p>Which sectors moved most on the map on the <b>latest bar</b> of the selected timeframe.</p>
+            <ul>
+                <li><b>Rotating in</b>: relative strength rotating toward the sector (momentum and ratio rising). <b>Rotating out</b>: the opposite.</li>
+                <li><b>Arrow</b> = direction of the move on the map (up-right is gaining on both axes).</li>
+                <li><b>"Lagging → Improving"</b> means the sector changed quadrant on that bar.</li>
+                <li><b>Bar</b> = size of the move compared with the biggest mover.</li>
+            </ul>
+            <p>"Money" here means relative performance against Nifty, not actual traded money: index data has no volume.</p>`,
+    },
+    heat: {
+        title: 'Performance heatmap',
+        body: `<p>Plain price returns of each sector index, so you can see <b>absolute</b> moves next to the <b>relative</b> picture on the map.</p>
+            <ul>
+                <li><b>1D / 1W / 1M / 3M</b> = last 1, 5, 21 and 63 trading days.</li>
+                <li>Green = up, red = down. Colour strength is relative to the biggest move in that column.</li>
+                <li>Sorted by 1-month return. Click a name for details.</li>
+            </ul>
+            <p>A sector can be <b>Leading</b> on the map and still be red here, if Nifty fell even more.</p>`,
+    },
+    board: {
+        title: 'Momentum leaderboard',
+        body: `<p>Sectors ranked by the dashboard's <b>momentum score</b> (0–100), the same score used by the scanners.</p>
+            <ul>
+                <li><b>Score</b> = 50% relative strength + 50% price action. Hover the ring for the breakdown.</li>
+                <li><b>H D W M bars</b> = relative strength vs Nifty over hourly, daily, weekly and monthly lookbacks (weighted 20 / 30 / 40 / 10%).</li>
+                <li><b>20E / 50E</b> = index above its 20 / 50-day EMA. <b>HH</b> = making higher highs.</li>
+                <li><b>Trend</b> = Strong / Moderate / Weak / Bearish from the RS and price-action checks. It looks back, so it changes last.</li>
+                <li><b>↗ Turning up</b> = trend still Weak/Bearish, but the rotation map shows it gaining on Nifty (Improving or Leading): an early turn to watch. <b>↘ Cooling</b> = trend Strong/Moderate, but losing ground (Weakening or Lagging). Shown only when Daily and Weekly agree. Hover the tag for the readings.</li>
+                <li><b>Rotation</b> = the sector's quadrant on the selected timeframe. <b>Signals</b> = active scanner setups among its stocks.</li>
+            </ul>
+            <p>The score is a level ("how strong now"); the rotation map adds direction ("getting stronger or weaker").</p>`,
+    },
+};
+
+let _sxPopFor = null;
+
+function sxOpenInfo(btn) {
+    const key = btn.dataset.help;
+    const pop = document.getElementById('sx-pop');
+    const help = SX_HELP[key];
+    if (!pop || !help) return;
+    if (_sxPopFor === btn) { sxCloseInfo(); return; }
+    sxCloseInfo();
+    _sxPopFor = btn;
+    btn.setAttribute('aria-expanded', 'true');
+    pop.innerHTML = `<div class="sx-pop-title">${help.title}</div><div class="sx-pop-body">${help.body}</div>
+        <button type="button" class="sx-pop-more" onclick="sxCloseInfo(); sxOpenGuide();">Read the full guide →</button>`;
+    pop.hidden = false;
+    // Position under the button, kept inside the viewport.
+    const b = btn.getBoundingClientRect();
+    const w = Math.min(340, window.innerWidth - 24);
+    pop.style.width = `${w}px`;
+    let left = Math.min(Math.max(12, b.left + b.width / 2 - w / 2), window.innerWidth - w - 12);
+    pop.style.left = `${left}px`;
+    pop.style.top = '0px';
+    const h = pop.offsetHeight;
+    const below = b.bottom + 10;
+    pop.style.top = `${below + h > window.innerHeight - 12 ? Math.max(12, b.top - h - 10) : below}px`;
+    requestAnimationFrame(() => pop.classList.add('show'));
+}
+
+function sxCloseInfo() {
+    const pop = document.getElementById('sx-pop');
+    if (_sxPopFor) _sxPopFor.setAttribute('aria-expanded', 'false');
+    _sxPopFor = null;
+    if (!pop || pop.hidden) return;
+    pop.classList.remove('show');
+    pop.hidden = true;
+}
+
+function sxOpenGuide() {
+    const g = document.getElementById('sx-guide');
+    if (!g) return;
+    sxCloseInfo();
+    g.hidden = false;
+    document.getElementById('sx-guide-scrim').classList.add('open');
+    requestAnimationFrame(() => g.classList.add('open'));
+    g.querySelector('.sx-guide-body').scrollTop = 0;
+    g.querySelector('.sx-close')?.focus();
+}
+
+function sxCloseGuide() {
+    const g = document.getElementById('sx-guide');
+    if (!g || g.hidden) return;
+    g.classList.remove('open');
+    document.getElementById('sx-guide-scrim').classList.remove('open');
+    setTimeout(() => { if (!g.classList.contains('open')) g.hidden = true; }, 350);
+    document.getElementById('btn-sx-guide')?.focus();
+}
+
+document.addEventListener('click', e => {
+    const info = e.target.closest?.('.sx-info');
+    if (info) { e.stopPropagation(); sxOpenInfo(info); return; }
+    if (_sxPopFor && !e.target.closest?.('#sx-pop')) sxCloseInfo();
+});
+document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (_sxPopFor) { sxCloseInfo(); e.stopImmediatePropagation(); return; }
+    const g = document.getElementById('sx-guide');
+    if (g && !g.hidden) { sxCloseGuide(); e.stopImmediatePropagation(); }
+}, true);
+window.addEventListener('resize', sxCloseInfo);
+document.getElementById('content-sectors')?.addEventListener('scroll', sxCloseInfo, { passive: true });
+
+
 let _scoreTooltipEl = null;
 
 function showScoreTooltip(event, s) {
@@ -819,136 +1787,6 @@ function showFnoScoreTooltip(event, s) {
     _positionTooltip(tip, event);
 }
 
-function renderSectorsTable(sectors) {
-    window._lastSectors = sectors;
-    const rows = sectors.map(s => {
-        const trendColor = {
-            'Strong': '#22c55e',
-            'Moderate': '#eab308',
-            'Weak': 'var(--text-muted)',
-            'Bearish': '#ef4444',
-        }[s.trend || 'Weak'] || 'var(--text-muted)';
-
-        const rsBar = (val) => {
-            const pct = Math.round((val || 0) * 100);
-            const color = pct >= 65 ? '#22c55e' : pct >= 40 ? '#eab308' : 'var(--text-muted)';
-            return `<span style="font-size:0.55rem;color:${color};font-weight:600">${pct}%</span>`;
-        };
-
-        const badges = [
-            s.is_above_20ema ? '<span style="font-size:0.5rem;padding:0 2px;border-radius:3px;background:rgba(34,197,94,0.12);color:#22c55e">20E</span>' : '',
-            s.is_above_50ema ? '<span style="font-size:0.5rem;padding:0 2px;border-radius:3px;background:rgba(34,197,94,0.12);color:#22c55e">50E</span>' : '',
-            s.is_making_higher_highs ? '<span style="font-size:0.5rem;padding:0 2px;border-radius:3px;background:rgba(59,130,246,0.12);color:#3b82f6">HH</span>' : '',
-        ].filter(Boolean).join(' ');
-
-        const signalBadge = s.active_signals > 0
-            ? `<span class="text-2xs px-1.5 py-0.5 rounded-full font-medium" style="background:rgba(99,102,241,0.12);color:#818cf8">${s.active_signals}</span>`
-            : '';
-
-        const selected = _selectedSector === s.sector_name ? 'sector-selected' : '';
-
-        return `<tr class="cursor-pointer ${selected}" onclick="expandSector('${s.sector_name}')" id="sector-row-${s.sector_name.replace(/\s+/g, '-')}">
-            <td>
-                <span class="font-medium" style="font-size:0.6rem;color:var(--text-primary)">${s.sector_name}</span>
-                <span style="font-size:0.45rem;color:var(--text-muted);margin-left:2px">${s.stock_count}</span>
-            </td>
-            <td>${rsBar(s.hourly_rs || s.daily_rs || s.relative_strength)}</td>
-            <td>${rsBar(s.daily_rs || s.relative_strength)}</td>
-            <td>${rsBar(s.weekly_rs || s.relative_strength)}</td>
-            <td>${rsBar(s.monthly_rs || s.relative_strength)}</td>
-            <td><span style="font-size:0.5rem;padding:2px 4px;border-radius:3px;color:${trendColor};font-weight:500">${s.trend || '\u2014'}</span></td>
-            <td><span style="display:flex;gap:2px">${badges}</span></td>
-            <td style="font-weight:600;font-size:0.6rem;color:${(s.combined_score || 0) >= 0.6 ? '#22c55e' : (s.combined_score || 0) >= 0.4 ? '#eab308' : 'var(--text-muted)'}">
-                <span class="score-tooltip-trigger" data-sector="${s.sector_name}"
-                    onmouseenter="showScoreTooltip(event, ${JSON.stringify(s).replace(/"/g, '&quot;')})"
-                    onmouseleave="hideScoreTooltip()"
-                >${Math.round((s.combined_score || 0) * 100)}%</span>
-            </td>
-            <td>${signalBadge}</td>
-        </tr>`;
-    }).join('');
-
-    document.getElementById('sectors-table').innerHTML = `
-        <table class="data-table">
-            <thead><tr>
-                <th>Sector</th>
-                <th>Hourly</th>
-                <th>Daily</th>
-                <th>Weekly</th>
-                <th>Monthly</th>
-                <th>Trend</th>
-                <th></th>
-                <th>Score</th>
-                <th></th>
-            </tr></thead>
-            <tbody>${rows}</tbody>
-        </table>`;
-    applySortable('sectors-table');
-}
-
-async function expandSector(sectorName) {
-    _selectedSector = sectorName;
-
-    if (window._lastSectors) renderSectorsTable(window._lastSectors);
-
-    const panel = document.getElementById('sector-stocks-panel');
-    const titleEl = document.getElementById('sector-stocks-title');
-    const listEl = document.getElementById('sector-stocks-list');
-
-    titleEl.textContent = sectorName;
-    panel.classList.remove('hidden');
-    listEl.innerHTML = '<div class="p-2 text-center"><span class="spinner"></span></div>';
-
-    loadSectorChart(sectorName);
-
-    try {
-        const response = await fetch(`${API_BASE}/api/settings/sectors/${encodeURIComponent(sectorName)}/stocks`);
-        const stocks = await response.json();
-
-        if (!stocks.length) {
-            listEl.innerHTML = '<div class="p-6 text-center text-xs" style="color:var(--text-muted)">No stocks found for this sector.</div>';
-            return;
-        }
-
-        const rows = stocks.map(s => {
-            const signalBadge = s.has_signal
-                ? `<span class="text-2xs px-1.5 py-0.5 rounded-full ${s.signal_status === 'exploded' ? 'status-exploded' : ''} font-medium" style="background:rgba(99,102,241,0.12);color:#818cf8">${s.signal_type === 'explosion' ? 'BREAKOUT' : 'VCP'} ${Math.round((s.signal_score || 0) * 100)}%</span>`
-                : '';
-            const occBadge = s.occurrence_number > 1
-                ? `<span class="occurrence-${Math.min(s.occurrence_number, 3)} text-2xs px-1 py-0.5 rounded-full ml-1">${ordinal(s.occurrence_number)} time</span>`
-                : '';
-            const fnoBadge = s.is_fno
-                ? '<span class="text-2xs px-1 py-0.5 rounded" style="background:rgba(168,85,247,0.12);color:#a78bfa">F&O</span>'
-                : '';
-
-            return `<tr>
-                <td class="font-medium" style="color:var(--text-primary)">${s.symbol}${occBadge}</td>
-                <td style="color:var(--text-secondary)">${s.display_name || ''}</td>
-                <td>${fnoBadge}</td>
-                <td>${s.is_fno ? s.lot_size : ''}</td>
-                <td>${signalBadge}</td>
-            </tr>`;
-        }).join('');
-
-        listEl.innerHTML = `
-            <table class="data-table">
-                <thead><tr>
-                    <th>Symbol</th><th>Name</th><th>Type</th><th>Lot</th><th>Signal</th>
-                </tr></thead>
-                <tbody>${rows}</tbody>
-            </table>`;
-        makeTableSortable(listEl.querySelector('.data-table'));
-    } catch (err) {
-        listEl.innerHTML = `<div class="p-4 text-center text-red-400 text-xs">Error loading stocks: ${err.message}</div>`;
-    }
-}
-
-function closeSectorStocks() {
-    _selectedSector = null;
-    document.getElementById('sector-stocks-panel').classList.add('hidden');
-    if (window._lastSectors) renderSectorsTable(window._lastSectors);
-}
-
 async function loadSectorChart(sectorName) {
     const canvas = document.getElementById('sector-chart');
     const ctx = canvas.getContext('2d');
@@ -1124,86 +1962,6 @@ function drawWeeklyChart(ctx, w, h, candles, ema20, ema50) {
     ctx.font = 'bold 8px sans-serif';
     ctx.textAlign = 'right';
     ctx.fillText(lastC.c.toFixed(2), w - 3, yP(lastC.c) - 3);
-}
-
-async function runSectorAnalysisFromTab() {
-    const btn = document.getElementById('btn-refresh-sectors');
-    const statusEl = document.getElementById('sector-tab-status');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Analyzing...';
-    if (statusEl) {
-        statusEl.textContent = 'Refreshing sectors...';
-        statusEl.style.color = 'var(--text-muted)';
-    }
-
-    try {
-        const response = await fetch(`${API_BASE}/api/settings/scan/sectors`, { method: 'POST' });
-        const data = await response.json();
-        if (data.sectors) {
-            window._lastSectors = data.sectors;
-            renderSectorsTable(data.sectors);
-            if (statusEl) {
-                statusEl.textContent = `Refreshed ${data.sectors.length} sectors`;
-                statusEl.style.color = '#22c55e';
-            }
-        } else {
-            loadSectorsTab();
-            if (statusEl) {
-                statusEl.textContent = 'Refresh complete';
-                statusEl.style.color = '#22c55e';
-            }
-        }
-        if (_sectorTelegramOnRefresh) {
-            if (statusEl) {
-                statusEl.textContent = 'Refreshed. Sending Telegram...';
-                statusEl.style.color = 'var(--text-muted)';
-            }
-            try {
-                const notify = await notifySectorReportToTelegram();
-                if (statusEl) {
-                    statusEl.textContent = `Refreshed + Telegram sent${notify?.telegram?.message_id ? ` (msg #${notify.telegram.message_id})` : ''}`;
-                    statusEl.style.color = '#22c55e';
-                }
-            } catch (err) {
-                if (statusEl) {
-                    statusEl.textContent = `Refreshed, Telegram failed: ${err.message}`;
-                    statusEl.style.color = '#ef4444';
-                }
-            }
-        }
-    } catch (err) {
-        console.error('Sector analysis failed:', err);
-        if (statusEl) {
-            statusEl.textContent = `Refresh failed: ${err.message}`;
-            statusEl.style.color = '#ef4444';
-        }
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = 'Refresh Sectors';
-    }
-}
-
-async function sendSectorReportToTelegram() {
-    if (!isAdminUser()) return;
-    const statusEl = document.getElementById('sector-tab-status');
-    if (statusEl) {
-        statusEl.textContent = 'Sending Telegram report...';
-        statusEl.style.color = 'var(--text-muted)';
-    }
-
-    try {
-        const notify = await notifySectorReportToTelegram();
-        if (statusEl) {
-            statusEl.textContent = `Telegram sent${notify?.telegram?.message_id ? ` (msg #${notify.telegram.message_id})` : ''}`;
-            statusEl.style.color = '#22c55e';
-        }
-        loadSectorsTab();
-    } catch (err) {
-        if (statusEl) {
-            statusEl.textContent = `Telegram send failed: ${err.message}`;
-            statusEl.style.color = '#ef4444';
-        }
-    }
 }
 
 // --- Signals ---
@@ -4135,7 +4893,10 @@ async function refreshInstruments() {
         const d = await stFetchJson(`${API_BASE}/api/settings/instruments/refresh`, { method: 'POST' });
         stAlert('instruments-status', 'ok',
             `<strong>${stEsc(d.total_equity)}</strong> stocks · <strong>${stEsc(d.fno_symbols)}</strong> F&amp;O symbols`
-            + `<small>${stEsc(d.added)} new, ${stEsc(d.updated)} updated</small>`);
+            + `<small>${stEsc(d.added)} new, ${stEsc(d.updated)} updated`
+            + (d.constituents ? ` · sector lists: ${stEsc(d.constituents.updated_sectors)} of ${stEsc(d.constituents.total_sectors)} indices updated from NSE`
+                + (d.constituents.failed_sectors?.length ? ` (kept previous for ${stEsc(d.constituents.failed_sectors.join(', '))})` : '') : '')
+            + `</small>`);
     } catch (err) {
         stAlert('instruments-status', 'err', `Refresh failed: ${stEsc(err.message)}`);
     } finally {

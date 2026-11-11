@@ -247,6 +247,23 @@ async def _run_order_safety_jobs():
         db.close()
 
 
+async def _run_daily_ipo_refresh():
+    """Roll IPO all-time highs forward after the close (incremental, one candle call per stock)."""
+    if not is_market_day():
+        return
+    from backend.models.database import get_session_factory
+    from backend.services import ipo_tracker
+
+    db = get_session_factory()()
+    try:
+        result = await ipo_tracker.refresh(db)
+        logger.info("Daily IPO tracker refresh: %s", result)
+    except Exception as e:
+        logger.error("Daily IPO tracker refresh failed: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
 def start_scheduler():
     """Start the background scheduler with market-hours scan schedule."""
     global _scheduler
@@ -371,6 +388,22 @@ def start_scheduler():
         ),
         id="order_safety",
         name="Order protection + manual target monitor",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # IPO tracker: roll ATHs forward after the close (weekdays, 4:30 PM IST).
+    _scheduler.add_job(
+        _run_daily_ipo_refresh,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour=16,
+            minute=30,
+            timezone="Asia/Kolkata",
+        ),
+        id="ipo_tracker_daily",
+        name="IPO tracker refresh (4:30 PM)",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

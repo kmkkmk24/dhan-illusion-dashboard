@@ -17,6 +17,7 @@ from backend.api import (
     auth,
     ipos,
     techno_funda,
+    swing,
 )
 from backend.services.auth_service import ensure_seed_users, get_user_by_session
 
@@ -101,6 +102,7 @@ app.include_router(index_trading.router)
 app.include_router(value_investing.router)
 app.include_router(techno_funda.router)
 app.include_router(ipos.router)
+app.include_router(swing.router)
 
 
 # Health check

@@ -86,6 +86,25 @@ techno_funda:
     fundamental: 0.55
     technical: 0.45
 
+# ── Swing Trades (VCP / Flag / IPO setups) — all optional; these are the defaults ──
+# Money-management values can also be changed on the Swing Trades tab (saved to data/swing/settings.json).
+# Data: NSE bhavcopy (one free download/day, with delivery %) + a one-time Dhan back-fill per stock.
+swing:
+  capital: 500000            # INR used for position sizing
+  risk_per_trade_pct: 1.0    # a stop-out loses at most this % of capital
+  max_position_pct: 20       # cap on one stock's value as % of capital
+  max_open_trades: 6
+  max_per_sector: 2          # top picks per sector (concentration control)
+  auto_trail: false          # true = the app moves the broker stop-loss GTT itself
+  min_price: 50
+  max_price: 0               # 0 = no cap
+  min_turnover_cr: 5         # 20-day average traded value (crore) to enter the universe
+  top_picks: 8               # the action list never shows more than this
+  earnings_block_days: 7     # no top pick when results are due this soon
+  # setup_params:            # detector thresholds (see backend/services/swing/setups.py SetupParams)
+  #   max_risk_pct: 8.0
+  #   flag_min_pole_pct: 15.0
+
 # ── Server Settings ──
 server:
   host: "127.0.0.1"

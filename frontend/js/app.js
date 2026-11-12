@@ -135,7 +135,16 @@ function _navKey(el) {
     return el.classList.contains('nav-group') ? `group:${el.dataset.group}` : el.id.replace(/^tab-/, '');
 }
 
+/** Child links (e.g. the swing setups) always sit right under their parent tab, wherever it was moved. */
+function _navAttachSubs() {
+    document.querySelectorAll('.nav-sub-sub[data-parent]').forEach(sub => {
+        const parent = document.getElementById(`tab-${sub.dataset.parent}`);
+        if (parent && parent.nextElementSibling !== sub) parent.after(sub);
+    });
+}
+
 function _saveTabOrder() {
+    _navAttachSubs();
     const order = {};
     _navContainers().forEach(c => { order[_navContainerKey(c)] = _navEntries(c).map(_navKey); });
     try { localStorage.setItem(TAB_ORDER_KEY, JSON.stringify(order)); } catch (_) {}
@@ -154,6 +163,7 @@ function _applySavedTabOrder() {
         _navEntries(c).forEach(el => { if (!ordered.includes(el)) ordered.push(el); });
         ordered.forEach(el => c.appendChild(el));
     });
+    _navAttachSubs();
 }
 
 /** Tab to open on load: the first one (in the user's order) they can see. */
@@ -394,8 +404,7 @@ function togglePill(pill, section) {
         if (anyActive.length === 0 && allPill) allPill.classList.add('active');
     }
 
-    if (section === 'swing') loadSignals('swing');
-    else if (section === 'fno') loadFnoSignals();
+    if (section === 'fno') loadFnoSignals();
 }
 
 function getSelectedPills(containerId) {
@@ -561,7 +570,7 @@ function switchTab(tab) {
     }
     if (tab === 'ipos') { loadIposTab(); }
     if (tab === 'technofunda') { tfInit(); }
-    if (tab === 'swing') { loadSignals('swing'); showVcpInfo(); }
+    if (tab === 'swing') { swInit(); }
     if (tab === 'fno') { loadFnoSignals(); loadSchedulerStatus(); switchFnoSubTab(fnoSubTab); }
     if (tab === 'index') { loadIndexSignals(); }
     if (tab === 'value') { loadValueInvesting(); }
@@ -2317,14 +2326,12 @@ async function dismissSignal(id) {
     if (!confirm('Dismiss this signal?')) return;
     await fetch(`${API_BASE}/api/signals/${id}/dismiss`, { method: 'POST' });
     const activeTab = document.querySelector('.nav-item.active')?.id?.replace('tab-', '');
-    if (activeTab === 'swing') loadSignals('swing');
     if (activeTab === 'fno') loadFnoSignals();
 }
 
 async function reactivateSignal(id) {
     await fetch(`${API_BASE}/api/signals/${id}/reactivate`, { method: 'POST' });
     const activeTab = document.querySelector('.nav-item.active')?.id?.replace('tab-', '');
-    if (activeTab === 'swing') loadSignals('swing');
     if (activeTab === 'fno') loadFnoSignals();
 }
 
@@ -5263,142 +5270,682 @@ function formatCurrency(amount) {
 
 // --- VCP Scanner Functions ---
 
-function showVcpInfo() {
-    const panel = document.getElementById('vcp-info-panel');
-    if (panel) {
-        panel.classList.remove('hidden');
+// ── Swing Trades tab (VCP / Flag / IPO setups, trades, scorecard) ──
+
+const SW_VIEW_KEY = 'swing-view';
+let _swView = (() => { try { return localStorage.getItem(SW_VIEW_KEY) || 'picks'; } catch (_) { return 'picks'; } })();
+let _swOverview = null;
+let _swPoll = 0;
+const _swFilter = { status: 'actionable', tier: 'B' };
+const SW_STATUS = {
+    triggered: ['Breakout today', 'Closed above the entry today. Buy only if within 4% of the entry and volume confirms.'],
+    ready: ['Ready', 'Within a few % of the entry. Place a buy-stop (GTT) at the entry price.'],
+    forming: ['Forming', 'Pattern is building; not actionable yet. Watch it.'],
+    extended: ['Extended', 'Already more than 4% above the entry. Do not chase; wait for a new base or pullback.'],
+};
+const SW_COMP = { pattern: 'Pattern', trend: 'Trend', rs: 'Rel. strength', sector: 'Sector', smart_money: 'Smart money', risk: 'Risk / room' };
+const SW_COMP_HELP = {
+    pattern: 'How cleanly the chart pattern formed (contractions, tightness, volume dry-up).',
+    trend: 'Minervini trend template: price above rising 50/150/200-day averages, near 52-week highs.',
+    rs: 'RS rating (1–99): 12-month performance vs every stock in the universe. Leaders are 80+.',
+    sector: 'Rank of the stock’s sector in Sector Analysis and its rotation quadrant.',
+    smart_money: 'Institutional footprints: up-volume vs down-volume, rising delivery %, bulk/block buys, SMC liquidity sweeps / order blocks / fair-value gaps.',
+    risk: 'How tight the stop is, and how much room there is before the next resistance.',
+};
+
+const swEsc = v => stEsc(v);
+const swRs = v => (v == null || isNaN(v)) ? '—' : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2, minimumFractionDigits: v < 100 ? 2 : 0 });
+const swInr = v => (v == null || isNaN(v)) ? '—' : '₹' + Math.round(v).toLocaleString('en-IN');
+const swPct = (v, d = 1) => (v == null || isNaN(v)) ? '—' : `${v > 0 ? '+' : ''}${Number(v).toFixed(d)}%`;
+const swR = v => (v == null || isNaN(v)) ? '—' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}R`;
+
+async function swJson(url, opts = {}) {
+    const res = await fetch(`${API_BASE}${url}`, {
+        ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    });
+    let body = null;
+    try { body = await res.json(); } catch (_) { /* empty */ }
+    if (!res.ok) {
+        const d = body && (body.detail || body.message);
+        throw new Error(typeof d === 'string' ? d : `HTTP ${res.status}`);
     }
+    return body;
 }
 
-function toggleVcpInfo() {
-    const panel = document.getElementById('vcp-info-panel');
-    if (panel) {
-        panel.classList.toggle('hidden');
-    }
+function openSwing(view) {
+    _swView = view;
+    switchTab('swing');
 }
 
-function loadSwingSignalsWithVcpFilters() {
-    const statusFilters = getSelectedPills('swing-status-filter');
-    const scoreFilters = getSelectedPills('swing-score-filter');
-    
-    // Apply VCP-specific filtering
-    loadSignals('swing', { statusFilters, scoreFilters });
+async function swInit() {
+    swMarkTab();
+    await swLoadOverview();
+    swRender();
+    if (_swOverview?.scan?.running) swPollScan();
 }
 
-async function runSwingScan() {
-    const btn = document.getElementById('btn-swing-scan');
-    const statusEl = document.getElementById('swing-scan-status');
-    const originalText = btn.innerHTML;
-    
-    // Show loading state
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Scanning...';
-    
-    if (statusEl) {
-        statusEl.textContent = 'Running VCP scan... This may take a few minutes.';
-        statusEl.style.color = '#6366f1';
-    }
-    
+function swMarkTab() {
+    document.querySelectorAll('.sw-tabs [data-view]').forEach(b => {
+        const on = b.dataset.view === _swView;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+}
+
+function swView(v) {
+    _swView = v;
+    try { localStorage.setItem(SW_VIEW_KEY, v); } catch (_) { /* private mode */ }
+    swMarkTab();
+    swRender();
+}
+
+async function swLoadOverview() {
     try {
-        // Run the swing scan
-        const response = await fetch(`${API_BASE}/api/settings/scan/run?section=swing`, { method: 'POST' });
-        const data = await response.json();
-        
-        // Check if response indicates an error
-        if (data.error) {
-            throw new Error(data.message || 'Scan failed');
-        }
-        
-        const s = data.summary || {};
-        
-        // Show success feedback with scan results
-        let resultMsg = '✓ Scan Complete';
-        let statusMsg = data.message || 'Scan completed successfully';
-        
-        if (s.scanned) {
-            resultMsg = `✓ Found ${s.vcp_signals || 0} VCP`;
-            statusMsg = `Scanned ${s.scanned} stocks, found ${s.vcp_signals || 0} VCP patterns`;
-            if (s.chartink_matches) statusMsg += ` (${s.chartink_matches} passed Chartink filters)`;
-        }
-        
-        btn.innerHTML = resultMsg;
-        
-        if (statusEl) {
-            statusEl.textContent = statusMsg;
-            statusEl.style.color = '#22c55e';
-        }
-        
-        // Reload the signals to show new results
-        await loadSignals('swing');
-        
-        // Reset button after delay
-        setTimeout(() => {
-            btn.innerHTML = originalText;
-            btn.disabled = false;
-            if (statusEl) {
-                statusEl.textContent = '';
-            }
-        }, 5000);
-        
-    } catch (error) {
-        console.error('Error running swing scan:', error);
-        btn.innerHTML = '✗ Scan Failed';
-        
-        if (statusEl) {
-            statusEl.textContent = `Scan failed: ${error.message}`;
-            statusEl.style.color = '#ef4444';
-        }
-        
-        setTimeout(() => {
-            btn.innerHTML = originalText;
-            btn.disabled = false;
-            if (statusEl) {
-                statusEl.textContent = '';
-            }
-        }, 5000);
+        _swOverview = await swJson('/api/swing/overview');
+    } catch (e) {
+        _swOverview = null;
+        document.getElementById('sw-body').innerHTML = `<div class="sw-empty">Could not load swing data: ${swEsc(e.message)}</div>`;
+        return;
     }
+    const o = _swOverview;
+    const reg = o.regime;
+    const chip = document.getElementById('sw-regime-chip');
+    if (chip) {
+        chip.className = `sw-chip sw-reg--${reg?.label || 'na'}`;
+        chip.textContent = reg ? `Market: ${reg.label.toUpperCase()} · ${reg.score}` : 'Market: run a scan';
+        chip.title = reg ? (reg.notes || []).join('\n') : '';
+    }
+    const asof = document.getElementById('sw-asof');
+    if (asof) asof.textContent = o.last_run?.as_of ? `Data as of ${o.last_run.as_of}` : 'No scan yet';
+    const setN = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n ? n : ''; };
+    setN('sw-n-picks', o.top_picks?.length);
+    for (const t of ['VCP', 'FLAG', 'IPO']) {
+        const c = o.counts?.[t];
+        setN(`sw-n-${t}`, c ? (c.triggered + c.ready) || '' : '');
+    }
+    setN('sw-n-trades', (o.open_trades || 0) + (o.pending_trades || 0));
 }
 
-async function refreshSwingSignals() {
-    const btn = document.getElementById('btn-refresh-swing');
-    const originalText = btn.innerHTML;
-    
-    // Show loading state
+function swRender() {
+    if (_swView === 'picks') return swRenderPicks();
+    if (_swView === 'trades') return swRenderTrades();
+    if (_swView === 'score') return swRenderScore();
+    return swRenderList(_swView);
+}
+
+// ── scan ──
+async function swScan() {
+    const btn = document.getElementById('sw-scan-btn');
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Refreshing...';
-    
     try {
-        // Reload signals with current filters
-        await loadSignals('swing');
-        
-        // Show success feedback briefly
-        btn.innerHTML = '✓ Refreshed';
-        setTimeout(() => {
-            btn.innerHTML = originalText;
-            btn.disabled = false;
-        }, 1000);
-        
-    } catch (error) {
-        console.error('Error refreshing signals:', error);
-        btn.innerHTML = '✗ Error';
-        setTimeout(() => {
-            btn.innerHTML = originalText;
-            btn.disabled = false;
-        }, 2000);
+        await swJson('/api/swing/scan', { method: 'POST' });
+        swPollScan();
+    } catch (e) {
+        btn.disabled = false;
+        alert(`Scan could not start: ${e.message}`);
     }
 }
 
-// Enhanced signal rendering for VCP patterns
-function renderVcpSignal(signal) {
-    const vcpBadge = signal.signal_type === 'VCP' 
-        ? `<span class="text-2xs px-1.5 py-0.5 rounded-full" style="background:rgba(34,197,94,0.12);color:#22c55e;margin-left:4px">VCP</span>`
-        : '';
-    
-    const contractionInfo = signal.contraction_score 
-        ? `<div class="text-2xs mt-1" style="color:var(--text-muted)">Contraction: ${(signal.contraction_score * 100).toFixed(0)}% • Volume: ${(signal.breakout_score * 100).toFixed(0)}%</div>`
-        : '';
-    
-    return { vcpBadge, contractionInfo };
+function swPollScan() {
+    clearTimeout(_swPoll);
+    const box = document.getElementById('sw-progress');
+    const fill = document.getElementById('sw-progress-fill');
+    const text = document.getElementById('sw-progress-text');
+    const btn = document.getElementById('sw-scan-btn');
+    const tick = async () => {
+        let st;
+        try { st = (await swJson('/api/swing/scan/status')).status; } catch (_) { _swPoll = setTimeout(tick, 4000); return; }
+        if (st.running) {
+            box.hidden = false;
+            btn.disabled = true;
+            const pct = st.total ? Math.round(st.done / st.total * 100) : 5;
+            fill.style.width = `${pct}%`;
+            text.textContent = `${st.phase}${st.total ? ` · ${st.done}/${st.total}` : ''} — the first scan downloads ~3 years of candles once (several minutes); later scans take seconds.`;
+            _swPoll = setTimeout(tick, 2500);
+            return;
+        }
+        box.hidden = true;
+        btn.disabled = false;
+        if (st.error) alert(`Swing scan failed: ${st.error}`);
+        await swLoadOverview();
+        swRender();
+    };
+    tick();
+}
+
+// ── regime ──
+function swRegimeBanner(reg) {
+    if (!reg) return '';
+    const b = reg.breadth || {};
+    const msg = {
+        uptrend: 'Breakouts work best now. Full position size; A+ and A setups are suggested.',
+        caution: 'Mixed market. Half position size; only A+ setups are suggested.',
+        downtrend: 'Most breakouts fail in a downtrend. No new entries are suggested — cash is a position.',
+    }[reg.label] || '';
+    return `<section class="sw-regime sw-reg--${reg.label}">
+        <div><b>Market regime: ${swEsc(reg.label.toUpperCase())}</b> <span class="sw-muted">score ${reg.score}/100 · size ×${reg.risk_mult}</span>
+            <p>${swEsc(msg)}</p></div>
+        <ul>${(reg.notes || []).map(n => `<li>${swEsc(n)}</li>`).join('')}</ul>
+        <div class="sw-regime-stats"><span>${b.above50_pct ?? '—'}%<small>above 50-DMA</small></span>
+            <span>${b.above200_pct ?? '—'}%<small>above 200-DMA</small></span>
+            <span>${b.new_highs ?? '—'} / ${b.new_lows ?? '—'}<small>52w highs / lows</small></span></div>
+    </section>`;
+}
+
+// ── top picks ──
+function swRenderPicks() {
+    const body = document.getElementById('sw-body');
+    const o = _swOverview;
+    if (!o) return;
+    const unprot = (o.unprotected || []).length
+        ? `<div class="sw-alert sw-alert--err">UNPROTECTED position(s): ${o.unprotected.map(swEsc).join(', ')} — the stop-loss GTT is not live on Dhan. Open “My trades”.</div>` : '';
+    if (!o.last_run?.ok && !o.top_picks?.length) {
+        body.innerHTML = unprot + `<div class="sw-empty"><h3>No scan yet</h3><p>Press <b>Run scan</b>. The first run downloads about 3 years of daily candles for every liquid NSE stock once
+            (several minutes, runs in the background). After that the scan runs automatically every trading day at 6:45 PM from the free NSE bhavcopy and takes seconds.</p></div>`;
+        return;
+    }
+    const picks = o.top_picks || [];
+    const s = o.last_run?.setups || {};
+    body.innerHTML = `${unprot}${swRegimeBanner(o.regime)}
+        <div class="sw-section-head"><h3>Top picks <span class="sw-muted">(${picks.length} of max ${o.settings?.top_picks})</span></h3>
+            <span class="sw-muted">Scanned ${o.last_run?.scanned ?? '—'} liquid stocks · ${s.VCP || 0} VCP · ${s.FLAG || 0} flags · ${s.IPO || 0} IPO bases ·
+            ranked by quality, max ${o.settings?.max_per_sector} per sector, no results-week names</span></div>
+        ${picks.length ? `<div class="sw-cards">${picks.map(swCard).join('')}</div>`
+            : `<div class="sw-empty"><p>No setup cleared the A-grade bar today${o.regime?.label === 'downtrend' ? ' (market in a downtrend)' : ''}.
+               Nothing to buy is a valid answer: the watchlists in the VCP / Flag / IPO tabs show what is forming.</p></div>`}
+        <p class="sw-foot">Not investment advice. Setups are technical patterns; every plan uses a stop-loss sized to risk ${o.settings?.risk_per_trade_pct}% of your capital.
+            Accuracy of every suggestion is tracked automatically on the Scorecard.</p>`;
+}
+
+function swStatusPill(st) {
+    const [label, help] = SW_STATUS[st] || [st, ''];
+    return `<span class="sw-pill sw-st--${swEsc(st)}" title="${swEsc(help)}">${swEsc(label)}</span>`;
+}
+
+function swTierPill(r) {
+    return `<span class="sw-tier sw-tier--${(r.tier || 'C').replace('+', 'p')}" title="Quality score ${r.score}/100">${swEsc(r.tier)} · ${Math.round(r.score)}</span>`;
+}
+
+function swSetupBadge(t) {
+    return `<span class="sw-setup sw-setup--${swEsc(t)}">${t === 'IPO' ? 'IPO base' : t === 'FLAG' ? 'Flag' : 'VCP'}</span>`;
+}
+
+function swSymbol(r) {
+    return `<button type="button" class="sw-sym" onclick="event.stopPropagation(); swOpenChart('${swEsc(r.symbol)}')" title="Open the chart on Dhan (symbol copied)">${swEsc(r.symbol)}</button>`;
+}
+
+function swOpenChart(sym) {
+    navigator.clipboard?.writeText(sym).catch(() => {});
+    if (!sxOpenTab(SX_DHAN_TV_URL)) alert('Your browser blocked the new tab. Allow pop-ups for this site.');
+}
+
+function swComponents(c) {
+    return `<div class="sw-comp">${Object.entries(SW_COMP).map(([k, label]) => {
+        const v = Math.round((c?.[k] ?? 0) * 100);
+        return `<div title="${swEsc(SW_COMP_HELP[k])}"><span>${label}</span><i><b style="width:${v}%"></b></i><em>${v}</em></div>`;
+    }).join('')}</div>`;
+}
+
+function swPlanGrid(r) {
+    const sz = r.sizing || {};
+    return `<div class="sw-plan">
+        <div><span>Buy above</span><b>${swRs(r.entry)}</b></div>
+        <div><span>Stop loss</span><b class="sw-neg">${swRs(r.stop)}</b><small>−${(r.risk_pct ?? 0).toFixed(1)}%</small></div>
+        <div><span>T1 (2R)</span><b class="sw-pos">${swRs(r.target1)}</b></div>
+        <div><span>T2</span><b class="sw-pos">${swRs(r.target2)}</b><small>${r.rr ? r.rr + 'R' : ''}</small></div>
+        <div><span>Qty</span><b>${sz.qty ?? '—'}</b><small>${swInr(sz.position_value)}${sz.pct_of_capital != null ? ` · ${sz.pct_of_capital}%` : ''}</small></div>
+        <div><span>Risk</span><b>${swInr(sz.risk_amount)}</b><small>if stopped</small></div>
+    </div>`;
+}
+
+function swCard(r) {
+    const reasons = (r.reasons || []).slice(0, 5);
+    const warns = r.warnings || [];
+    const f = r.features || {};
+    return `<article class="sw-card" onclick="swDetail(${r.id})">
+        <header>
+            <div>${swSymbol(r)} ${swSetupBadge(r.setup)} ${r.is_fno ? '<span class="sw-tag">F&amp;O</span>' : ''}
+                <div class="sw-name">${swEsc(r.name || '')}${r.sector ? ` · ${swEsc(r.sector)}${r.sector_rank ? ` #${r.sector_rank}` : ''}` : ''}</div></div>
+            <div class="sw-card-tags">${swTierPill(r)} ${swStatusPill(r.status)}</div>
+        </header>
+        <div class="sw-card-price"><b>${swRs(r.close)}</b> <span class="sw-muted">${r.distance_pct != null ? (r.distance_pct > 0 ? `${r.distance_pct.toFixed(1)}% below entry` : `${(-r.distance_pct).toFixed(1)}% above entry`) : ''} · RS ${r.rs_rating ?? '—'}</span></div>
+        ${r.chart ? swChart(r.chart, r, 600, 170) : ''}
+        ${swPlanGrid(r)}
+        <ul class="sw-why">${reasons.map(x => `<li>${swEsc(x)}</li>`).join('')}</ul>
+        ${warns.length ? `<ul class="sw-warn">${warns.map(x => `<li>${swEsc(x)}</li>`).join('')}</ul>` : ''}
+        ${swComponents(r.components)}
+        <footer onclick="event.stopPropagation()">${swTradeButtons(r)}
+            <button type="button" class="tf-btn sw-ghost" onclick="swDismiss(${r.id})" title="Hide this setup">Dismiss</button></footer>
+    </article>`;
+}
+
+function swTradeButtons(r) {
+    if (!isAdminUser()) return '';
+    const live = r.status === 'triggered'
+        ? `<button type="button" class="tf-btn" onclick="swTradeDialog(${r.id}, 'limit')">Buy now (limit)</button>`
+        : `<button type="button" class="tf-btn" onclick="swTradeDialog(${r.id}, 'gtt')" title="A Dhan Forever Order that buys only when price breaks above the entry">Place buy-stop GTT</button>`;
+    return `<button type="button" class="tf-btn tf-btn--primary" onclick="swTradeDialog(${r.id}, 'paper')">Paper trade</button>${r.status === 'extended' ? '' : live}`;
+}
+
+// ── mini candlestick chart with plan levels ──
+function swChart(rows, r, W = 600, H = 170) {
+    if (!rows?.length) return '';
+    const volH = 26, top = 6, priceH = H - volH - top - 4;
+    const lo = Math.min(...rows.map(x => x[3]), r.stop ?? Infinity) * 0.995;
+    const hi = Math.max(...rows.map(x => x[2]), r.target1 ?? -Infinity) * 1.005;
+    const y = v => top + (hi - v) / (hi - lo) * priceH;
+    const n = rows.length, bw = W / n;
+    const vmax = Math.max(...rows.map(x => x[5])) || 1;
+    let candles = '', vols = '';
+    rows.forEach((x, i) => {
+        const [, o, h, l, c, v] = x;
+        const cx = i * bw + bw / 2, up = c >= o;
+        const cls = up ? 'sw-c-up' : 'sw-c-dn';
+        candles += `<line x1="${cx.toFixed(1)}" x2="${cx.toFixed(1)}" y1="${y(h).toFixed(1)}" y2="${y(l).toFixed(1)}" class="${cls}"/>`;
+        const yb = y(Math.max(o, c)), hb = Math.max(1, Math.abs(y(o) - y(c)));
+        candles += `<rect x="${(cx - bw * 0.35).toFixed(1)}" y="${yb.toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${hb.toFixed(1)}" class="${cls}"/>`;
+        const vh = v / vmax * volH;
+        vols += `<rect x="${(cx - bw * 0.35).toFixed(1)}" y="${(H - vh).toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${vh.toFixed(1)}" class="sw-vol"/>`;
+    });
+    const line = (v, cls, label) => v == null || v > hi || v < lo ? '' :
+        `<line x1="0" x2="${W}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}" class="${cls}"/><text x="${W - 4}" y="${(y(v) - 3).toFixed(1)}" class="sw-lbl ${cls}" text-anchor="end">${label} ${swRs(v)}</text>`;
+    return `<svg class="sw-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Last ${n} days with entry, stop and targets">
+        ${vols}${candles}${line(r.target2, 'sw-l-t2', 'T2')}${line(r.target1, 'sw-l-t1', 'T1')}${line(r.entry, 'sw-l-entry', 'Entry')}${line(r.stop, 'sw-l-stop', 'Stop')}
+    </svg>`;
+}
+
+// ── per-setup lists ──
+async function swRenderList(type) {
+    const body = document.getElementById('sw-body');
+    body.innerHTML = '<div class="sw-empty">Loading…</div>';
+    const statusMap = { actionable: 'triggered,ready', forming: 'forming', extended: 'extended', all: '' };
+    let rows;
+    try {
+        const qs = new URLSearchParams({ setup: type, min_tier: _swFilter.tier });
+        if (statusMap[_swFilter.status]) qs.set('status', statusMap[_swFilter.status]);
+        rows = await swJson(`/api/swing/setups?${qs}`);
+    } catch (e) {
+        body.innerHTML = `<div class="sw-empty">${swEsc(e.message)}</div>`;
+        return;
+    }
+    const intro = {
+        VCP: 'Volatility Contraction Pattern (Minervini): a stock in a Stage-2 uptrend pulls back in smaller and smaller waves (e.g. 18% → 9% → 4%) on drying volume. Buy the break of the last, tightest contraction; the stop sits just under it.',
+        FLAG: 'Bull flag: a sharp, high-volume run-up (the pole) followed by a short, tight, low-volume drift (the flag). Buy the break of the flag; the stop sits under the flag low. Target = the pole’s height.',
+        IPO: 'IPO base: a recent listing (under 2 years) that consolidates below its post-listing high while volume dries up. The breakout to new all-time highs has no overhead supply — no trapped sellers above.',
+    }[type];
+    const chip = (group, val, label) => `<button type="button" class="sw-fchip ${_swFilter[group] === val ? 'active' : ''}" onclick="_swFilter['${group}']='${val}'; swRenderList('${type}')">${label}</button>`;
+    body.innerHTML = `<p class="sw-intro">${swEsc(intro)}</p>
+        <div class="sw-filters">
+            <div>${chip('status', 'actionable', 'Actionable')}${chip('status', 'forming', 'Forming')}${chip('status', 'extended', 'Extended')}${chip('status', 'all', 'All')}</div>
+            <div>${chip('tier', 'A', 'A+ / A')}${chip('tier', 'B', 'B and better')}${chip('tier', 'C', 'All grades')}</div>
+            <span class="sw-muted">${rows.length} setup${rows.length === 1 ? '' : 's'}</span>
+        </div>
+        ${rows.length ? `<div class="sw-table-wrap"><table class="sw-table">
+            <thead><tr><th>Stock</th><th>Grade</th><th>Status</th><th class="r">Close</th><th class="r">Entry</th><th class="r">Gap</th>
+                <th class="r">Stop</th><th class="r">T1 / T2</th><th class="r">Qty</th><th class="r">RS</th><th>Sector</th><th>Pattern</th><th></th></tr></thead>
+            <tbody>${rows.map(swRow).join('')}</tbody></table></div>`
+            : '<div class="sw-empty">Nothing here with these filters.</div>'}`;
+}
+
+function swPatternNote(r) {
+    const m = r.metrics || {};
+    if (r.setup === 'VCP') return `${(m.contractions || []).map(x => Math.round(x) + '%').join(' → ')} · ${m.base_days}d base`;
+    if (r.setup === 'FLAG') return `pole +${Math.round(m.pole_pct)}% / ${m.pole_days}d · flag ${m.flag_days}d, −${Math.round(m.retrace_pct)}%`;
+    return `listed ${m.listing_age_days}d · base ${m.base_days}d, ${Math.round(m.depth_pct)}% deep`;
+}
+
+function swRow(r) {
+    const warn = (r.warnings || []).length;
+    return `<tr class="${r.top_pick ? 'sw-row-pick' : ''}" onclick="swDetail(${r.id})">
+        <td>${swSymbol(r)}${r.top_pick ? ' <span class="sw-star" title="Top pick">★</span>' : ''}</td>
+        <td>${swTierPill(r)}</td><td>${swStatusPill(r.status)}</td>
+        <td class="r">${swRs(r.close)}</td><td class="r"><b>${swRs(r.entry)}</b></td>
+        <td class="r">${r.distance_pct != null ? swPct(r.distance_pct) : '—'}</td>
+        <td class="r sw-neg">${swRs(r.stop)} <small>−${(r.risk_pct ?? 0).toFixed(1)}%</small></td>
+        <td class="r sw-pos">${swRs(r.target1)} / ${swRs(r.target2)}</td>
+        <td class="r">${r.sizing?.qty ?? '—'}</td><td class="r">${r.rs_rating ?? '—'}</td>
+        <td>${swEsc(r.sector || '—')}${r.sector_rank ? ` <small>#${r.sector_rank}</small>` : ''}</td>
+        <td class="sw-muted">${swEsc(swPatternNote(r))}</td>
+        <td>${warn ? `<span class="sw-warnicon" title="${swEsc(r.warnings.join('\n'))}">⚠ ${warn}</span>` : ''}</td>
+    </tr>`;
+}
+
+async function swDetail(id) {
+    let r;
+    try { r = await swJson(`/api/swing/setups/${id}`); } catch (e) { alert(e.message); return; }
+    const f = r.features || {};
+    const facts = [
+        ['RS rating', r.rs_rating], ['RS line new high', f.rs_line_new_high == null ? '—' : f.rs_line_new_high ? 'Yes' : 'No'],
+        ['From 52w high', swPct(f.from_hi52_pct)], ['1M / 3M return', `${swPct(f.ret_1m)} / ${swPct(f.ret_3m)}`],
+        ['Up/down volume', f.up_down_vol ?? '—'], ['Delivery (10d vs 60d)', f.deliv_recent ? `${f.deliv_recent}% vs ${f.deliv_base ?? '—'}%` : '—'],
+        ['ATR (daily range)', f.atr_pct != null ? f.atr_pct + '%' : '—'], ['Avg traded value', f.turnover_cr != null ? `₹${f.turnover_cr} Cr/day` : '—'],
+        ['Next resistance', r.overhead ? swRs(r.overhead) : 'None (all-time high zone)'],
+        ['Results / board meeting', r.event ? `${r.event.date} (${r.event.days}d)` : 'None in 3 weeks'],
+        ['NSE surveillance', r.surveillance ? r.surveillance.desc : 'None'],
+    ];
+    swDialog(`<h3 id="sw-dialog-title">${swSymbol(r)} ${swSetupBadge(r.setup)} ${swTierPill(r)} ${swStatusPill(r.status)}</h3>
+        <p class="sw-muted">${swEsc(r.name || '')} · ${swEsc(r.sector || 'sector n/a')} · close ${swRs(r.close)} · first seen ${r.first_seen}</p>
+        ${swChart(r.chart, r, 760, 230)}
+        ${swPlanGrid(r)}
+        <div class="sw-detail-grid">
+            <div><h4>Why it qualifies</h4><ul class="sw-why">${(r.reasons || []).map(x => `<li>${swEsc(x)}</li>`).join('')}</ul>
+                ${(r.warnings || []).length ? `<h4>Watch out</h4><ul class="sw-warn">${r.warnings.map(x => `<li>${swEsc(x)}</li>`).join('')}</ul>` : ''}</div>
+            <div><h4>Score breakdown</h4>${swComponents(r.components)}
+                <h4>Facts</h4><dl class="sw-facts">${facts.map(([k, v]) => `<dt>${swEsc(k)}</dt><dd>${swEsc(v ?? '—')}</dd>`).join('')}</dl></div>
+        </div>
+        <footer class="sw-dialog-foot">${swTradeButtons(r)}</footer>`);
+}
+
+function swDialog(html) {
+    const d = document.getElementById('sw-dialog');
+    document.getElementById('sw-dialog-body').innerHTML = html;
+    if (!d.open) d.showModal();
+}
+
+function swCloseDialog() {
+    const d = document.getElementById('sw-dialog');
+    if (d.open) d.close();
+}
+
+async function swDismiss(id) {
+    try { await swJson(`/api/swing/setups/${id}/dismiss`, { method: 'POST' }); } catch (e) { alert(e.message); return; }
+    await swLoadOverview();
+    swRender();
+}
+
+// ── trade ticket ──
+async function swTradeDialog(id, mode) {
+    let r;
+    try { r = await swJson(`/api/swing/setups/${id}`); } catch (e) { alert(e.message); return; }
+    const sz = r.sizing || {};
+    const live = mode !== 'paper';
+    const title = { paper: 'Paper trade', gtt: 'Buy-stop GTT on Dhan', limit: 'Buy now on Dhan (CNC limit)' }[mode];
+    const explain = {
+        paper: 'Tracked by the app only, no order is sent. It opens when the price reaches the entry (or enter your actual fill price if you already bought).',
+        gtt: 'A Dhan Forever Order that buys only if the price trades above the entry (limit 0.5% above, so a big gap-up is not chased). When it fills, the app places ONE OCO GTT: stop-loss + target.',
+        limit: 'A CNC limit buy now (after-market order if the market is closed). When it fills, the app places ONE OCO GTT: stop-loss + target.',
+    }[mode];
+    swDialog(`<h3 id="sw-dialog-title">${title}: ${swEsc(r.symbol)} ${swSetupBadge(r.setup)}</h3>
+        <p class="sw-muted">${swEsc(explain)}</p>
+        <form id="sw-ticket" class="sw-ticket" onsubmit="event.preventDefault(); swSubmitTrade(${r.id}, '${mode}')">
+            <label>Quantity<input name="qty" type="number" min="1" step="1" value="${sz.qty || 1}" required oninput="swTicketCalc()"></label>
+            <label>Entry ₹<input name="entry" type="number" step="0.05" value="${r.entry}" required oninput="swTicketCalc()"></label>
+            <label>Stop loss ₹<input name="stop" type="number" step="0.05" value="${r.stop}" required oninput="swTicketCalc()"></label>
+            <label>Target (T2) ₹<input name="target" type="number" step="0.05" value="${r.target2}" required oninput="swTicketCalc()"></label>
+            <label>T1 (book half) ₹<input name="t1" type="number" step="0.05" value="${r.target1}"></label>
+            ${mode === 'limit' ? `<label>Limit price ₹<input name="limit_price" type="number" step="0.05" value="${r.close}"></label>` : ''}
+            ${mode === 'paper' ? `<label>Already bought at ₹ <small>(optional)</small><input name="fill_price" type="number" step="0.05" placeholder="leave empty to wait for entry"></label>` : ''}
+            <div id="sw-ticket-calc" class="sw-ticket-calc"></div>
+            ${live ? `<label class="sw-check"><input type="checkbox" name="confirm" required> I understand this sends a REAL order to Dhan with my money.</label>` : ''}
+            ${r.regime === 'downtrend' && live ? `<label class="sw-check"><input type="checkbox" name="override_regime"> The market is in a DOWNTREND; enter anyway.</label>` : ''}
+            <div id="sw-ticket-err" class="sw-alert sw-alert--err" hidden></div>
+            <footer class="sw-dialog-foot"><button type="button" class="tf-btn" onclick="swCloseDialog()">Cancel</button>
+                <button type="submit" class="tf-btn tf-btn--primary">${live ? 'Place order' : 'Record paper trade'}</button></footer>
+        </form>`);
+    swTicketCalc();
+}
+
+function swTicketCalc() {
+    const f = document.getElementById('sw-ticket');
+    if (!f) return;
+    const v = n => parseFloat(f.elements[n]?.value) || 0;
+    const qty = v('qty'), e = v('entry'), s = v('stop'), t = v('target');
+    const cap = _swOverview?.settings?.capital || 0;
+    const risk = qty * (e - s), val = qty * e;
+    const rr = e > s ? (t - e) / (e - s) : 0;
+    const bad = !(s > 0 && s < e && e < t);
+    document.getElementById('sw-ticket-calc').innerHTML = bad ? '<span class="sw-neg">Needs stop &lt; entry &lt; target</span>'
+        : `Position ${swInr(val)} (${cap ? (val / cap * 100).toFixed(1) : '—'}% of capital) · risk if stopped <b>${swInr(risk)}</b>
+           (${cap ? (risk / cap * 100).toFixed(2) : '—'}% of capital) · reward:risk <b>${rr.toFixed(1)}</b>`;
+}
+
+async function swSubmitTrade(setupId, mode) {
+    const f = document.getElementById('sw-ticket');
+    const err = document.getElementById('sw-ticket-err');
+    const val = n => f.elements[n]?.value;
+    const body = { setup_id: setupId, mode, qty: +val('qty'), entry: +val('entry'), stop: +val('stop'), target: +val('target'), t1: +val('t1') };
+    if (val('limit_price')) body.limit_price = +val('limit_price');
+    if (val('fill_price')) body.fill_price = +val('fill_price');
+    if (f.elements.override_regime?.checked) body.override_regime = true;
+    const btn = f.querySelector('button[type=submit]');
+    btn.disabled = true;
+    err.hidden = true;
+    try {
+        let res;
+        try {
+            res = await swJson('/api/swing/trades', { method: 'POST', body: JSON.stringify(body) });
+        } catch (e) {
+            // Server-side guards (existing holding, >3% risk, max trades, downtrend) can be overridden explicitly.
+            if (!/confirm the override/i.test(e.message) || !confirm(`${e.message}
+
+Proceed anyway?`)) throw e;
+            Object.assign(body, { override_holding: true, override_risk: true, override_limits: true, override_regime: true });
+            res = await swJson('/api/swing/trades', { method: 'POST', body: JSON.stringify(body) });
+        }
+        swCloseDialog();
+        alert(res.message || 'Done');
+        await swLoadOverview();
+        swView('trades');
+    } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// ── my trades ──
+async function swRenderTrades() {
+    const body = document.getElementById('sw-body');
+    body.innerHTML = '<div class="sw-empty">Loading trades…</div>';
+    let open, closed;
+    try {
+        [open, closed] = await Promise.all([swJson('/api/swing/trades?state=open'), swJson('/api/swing/trades?state=closed')]);
+    } catch (e) {
+        body.innerHTML = `<div class="sw-empty">${swEsc(e.message)}</div>`;
+        return;
+    }
+    const unreal = open.reduce((a, t) => a + (t.unrealized || 0), 0);
+    const realized = closed.reduce((a, t) => a + (t.pnl || 0), 0);
+    body.innerHTML = `<div class="sw-section-head"><h3>Open &amp; pending (${open.length})</h3>
+            <span>Unrealised <b class="${unreal >= 0 ? 'sw-pos' : 'sw-neg'}">${swInr(unreal)}</b>
+            ${isAdminUser() ? '<button type="button" class="tf-btn" onclick="swSync()">Sync with Dhan</button>' : ''}</span></div>
+        ${open.length ? `<div class="sw-trades">${open.map(swTradeCard).join('')}</div>` : '<div class="sw-empty">No open swing trades. Take one from Top picks.</div>'}
+        <div class="sw-section-head"><h3>Closed (${closed.length})</h3><span>Realised <b class="${realized >= 0 ? 'sw-pos' : 'sw-neg'}">${swInr(realized)}</b></span></div>
+        ${closed.length ? `<div class="sw-table-wrap"><table class="sw-table"><thead><tr><th>Stock</th><th>Setup</th><th>Mode</th><th>Entry</th><th>Exit</th>
+            <th class="r">Qty</th><th class="r">Result</th><th class="r">P&amp;L</th><th>Reason</th><th>Dates</th></tr></thead><tbody>
+            ${closed.map(t => `<tr><td><b>${swEsc(t.symbol)}</b></td><td>${swEsc(t.setup || '')}</td><td>${swEsc(t.mode)}</td>
+                <td>${swRs(t.entry)}</td><td>${swRs(t.exit_price)}</td><td class="r">${t.qty ?? ''}</td>
+                <td class="r ${t.r_result >= 0 ? 'sw-pos' : 'sw-neg'}">${swR(t.r_result)}</td>
+                <td class="r ${t.pnl >= 0 ? 'sw-pos' : 'sw-neg'}">${swInr(t.pnl)}</td><td>${swEsc(t.exit_reason || t.status)}</td>
+                <td class="sw-muted">${swEsc(t.entry_date || '')} → ${swEsc(t.exit_date || '')}</td></tr>`).join('')}</tbody></table></div>` : ''}`;
+}
+
+function swTradeCard(t) {
+    const adv = t.advice || {};
+    const acts = adv.actions || [];
+    const prot = t.mode === 'paper' ? '<span class="sw-tag">Paper</span>'
+        : t.status === 'pending' ? '<span class="sw-tag">Entry order waiting</span>'
+        : t.protected ? '<span class="sw-tag sw-tag--ok">SL + target GTT live</span>' : '<span class="sw-tag sw-tag--bad">UNPROTECTED</span>';
+    const admin = isAdminUser();
+    const actBtn = a => {
+        if (!admin) return '';
+        if (a.action === 'move_sl') return `<button type="button" class="tf-btn" onclick="swMoveSl(${t.id}, ${a.new_sl})">Move SL to ${swRs(a.new_sl)}</button>`;
+        if (a.action === 'book_partial') return `<button type="button" class="tf-btn" onclick="swPartial(${t.id}, ${a.qty})">Book ${a.qty}</button>`;
+        if (a.action === 'exit') return `<button type="button" class="tf-btn sw-danger" onclick="swExit(${t.id})">Exit now</button>`;
+        if (a.action === 'cancel_entry') return `<button type="button" class="tf-btn sw-danger" onclick="swExit(${t.id}, 'pending')">Cancel entry</button>`;
+        return '';
+    };
+    return `<article class="sw-trade ${acts.some(a => a.severity === 'high') ? 'sw-trade--alert' : ''}">
+        <header><div><b class="sw-trade-sym">${swEsc(t.symbol)}</b> ${t.setup ? swSetupBadge(t.setup) : ''} ${prot}
+            <div class="sw-muted">${t.status === 'pending' ? 'waiting for entry' : `since ${swEsc(t.entry_date || '—')}`} · qty ${t.qty}</div></div>
+            <div class="sw-trade-pl"><b class="${(t.unrealized ?? 0) >= 0 ? 'sw-pos' : 'sw-neg'}">${t.unrealized != null ? swInr(t.unrealized) : '—'}</b>
+            <span>${swR(t.r_now)} · LTP ${swRs(t.ltp)}</span></div></header>
+        <div class="sw-plan sw-plan--sm">
+            <div><span>Entry</span><b>${swRs(t.entry)}</b></div>
+            <div><span>Stop</span><b class="sw-neg">${swRs(t.sl)}</b>${t.initial_sl && t.sl !== t.initial_sl ? `<small>from ${swRs(t.initial_sl)}</small>` : ''}</div>
+            <div><span>T1</span><b class="sw-pos">${swRs(t.t1)}</b><small>${t.t1_done ? 'booked' : ''}</small></div>
+            <div><span>Target</span><b class="sw-pos">${swRs(t.target)}</b></div>
+        </div>
+        ${t.protection_note && t.mode !== 'paper' ? `<div class="sw-note">${swEsc(t.protection_note)}</div>` : ''}
+        ${acts.length ? `<ul class="sw-advice">${acts.map(a => `<li class="sw-sev--${a.severity}">${swEsc(a.reason)} ${actBtn(a)}</li>`).join('')}</ul>`
+            : (t.status === 'open' ? '<div class="sw-muted sw-hold">Hold: no action needed (advice refreshes after the close).</div>' : '')}
+        ${admin ? `<footer><button type="button" class="tf-btn" onclick="swMoveSlPrompt(${t.id}, ${t.sl})">Change SL</button>
+            <button type="button" class="tf-btn sw-danger" onclick="swExit(${t.id}, '${t.status}')">${t.status === 'pending' ? 'Cancel entry' : 'Exit now'}</button></footer>` : ''}
+    </article>`;
+}
+
+async function swTradeAction(url, body, okMsg) {
+    try {
+        const r = await swJson(url, { method: 'POST', body: JSON.stringify(body || {}) });
+        if (okMsg) alert(typeof okMsg === 'function' ? okMsg(r) : okMsg);
+    } catch (e) {
+        alert(e.message);
+    }
+    await swLoadOverview();
+    swRenderTrades();
+}
+
+function swMoveSl(id, sl) {
+    if (!confirm(`Move the stop-loss to ${swRs(sl)}? (live trades: the Dhan GTT is modified)`)) return;
+    swTradeAction(`/api/swing/trades/${id}/sl`, { new_sl: sl });
+}
+
+function swMoveSlPrompt(id, cur) {
+    const v = prompt(`New stop-loss (current ${swRs(cur)}). Stops can only be raised.`, cur);
+    if (v == null) return;
+    swTradeAction(`/api/swing/trades/${id}/sl`, { new_sl: parseFloat(v) });
+}
+
+function swPartial(id, qty) {
+    if (!confirm(`Sell ${qty} shares now and move the stop to breakeven for the rest?`)) return;
+    swTradeAction(`/api/swing/trades/${id}/partial`, { qty }, r => `Booked ${r.booked} @ ${swRs(r.price)}`);
+}
+
+function swExit(id, status) {
+    const msg = status === 'pending' ? 'Cancel the pending entry order?' : 'Exit this position now at market (paper: at the last price)?';
+    if (!confirm(msg)) return;
+    swTradeAction(`/api/swing/trades/${id}/exit`, {});
+}
+
+async function swSync() {
+    try {
+        const r = await swJson('/api/swing/trades/sync', { method: 'POST' });
+        if (r.events?.length) alert(r.events.map(e => `${e.symbol}: ${e.event}`).join('\n'));
+    } catch (e) { alert(e.message); }
+    swRenderTrades();
+}
+
+// ── scorecard ──
+async function swRenderScore() {
+    const body = document.getElementById('sw-body');
+    body.innerHTML = '<div class="sw-empty">Loading scorecard…</div>';
+    let a;
+    try { a = await swJson('/api/swing/accuracy'); } catch (e) { body.innerHTML = `<div class="sw-empty">${swEsc(e.message)}</div>`; return; }
+    const o = a.overall, p = a.top_picks;
+    const kpi = (label, v, help) => `<div class="sw-kpi" title="${swEsc(help)}"><b>${v ?? '—'}</b><span>${label}</span></div>`;
+    const edge = e => e ? `<span class="sw-edge sw-edge--${e}">${{ positive: 'Edge confirmed', thin: 'Thin edge', negative: 'No edge — review' }[e]}</span>` : '<span class="sw-muted">needs 15+ closed</span>';
+    const grp = (title, g) => `<div class="sw-table-wrap"><table class="sw-table"><thead><tr><th>${title}</th><th class="r">Suggested</th><th class="r">Triggered</th>
+        <th class="r">Closed</th><th class="r">Win %</th><th class="r">Avg R</th><th class="r">Profit factor</th><th class="r">Total R</th><th>Verdict</th></tr></thead><tbody>
+        ${Object.entries(g).map(([k, s]) => `<tr><td><b>${swEsc(k)}</b></td><td class="r">${s.suggested}</td><td class="r">${s.triggered} <small>${s.trigger_rate ?? '—'}%</small></td>
+        <td class="r">${s.closed}</td><td class="r">${s.win_rate ?? '—'}</td><td class="r">${s.avg_r ?? '—'}</td><td class="r">${s.profit_factor ?? '—'}</td>
+        <td class="r ${s.total_r >= 0 ? 'sw-pos' : 'sw-neg'}">${s.total_r}</td><td>${edge(s.edge)}</td></tr>`).join('') || '<tr><td colspan="9" class="sw-muted">No data yet</td></tr>'}</tbody></table></div>`;
+    body.innerHTML = `<p class="sw-intro">Every setup the dashboard suggests (Ready / Breakout, grade B or better) has its plan frozen on that day and is
+        replayed on the candles that followed — honestly: gap-ups fill at the open, gap-downs through the stop fill at the open, and if the stop and target are hit on the same day the stop counts.
+        Model: half booked at T1 (2R) with the stop moved to breakeven, the rest to T2; entries must trigger within ${a.rules.max_wait_days} sessions; time stop ${a.rules.max_hold_days} sessions.</p>
+        <div class="sw-kpis">
+            ${kpi('Suggestions', o.suggested, 'Setups suggested so far')}
+            ${kpi('Trigger rate', o.trigger_rate != null ? o.trigger_rate + '%' : null, 'Share of suggestions whose entry price was actually reached')}
+            ${kpi('Win rate', o.win_rate != null ? o.win_rate + '%' : null, 'Closed trades that made money')}
+            ${kpi('Avg R / trade', o.avg_r, 'Expectancy: average result in multiples of the initial risk. Above 0.3R is a strong system.')}
+            ${kpi('Profit factor', o.profit_factor, 'Gross R won ÷ gross R lost. Above 1.5 is good.')}
+            ${kpi('Avg loss', o.avg_loss_r, 'Average losing trade in R. Close to −1R or better means stops are respected.')}
+            ${kpi('Open', o.open, 'Triggered and still running')}
+            ${kpi('Top picks avg R', p.avg_r, 'Same, only for the Top picks list')}
+        </div>
+        <div class="sw-section-head"><h3>Overall verdict</h3>${edge(o.edge)}</div>
+        ${a.curve.length > 1 ? swCurve(a.curve) : ''}
+        <h4 class="sw-h4">By setup</h4>${grp('Setup', a.by_setup)}
+        <h4 class="sw-h4">By grade</h4>${grp('Grade', a.by_tier)}
+        <h4 class="sw-h4">By market regime</h4>${grp('Regime', a.by_regime)}
+        <h4 class="sw-h4">Your real trades (${a.real_trades.live} live, ${a.real_trades.paper} paper)</h4>
+        <div class="sw-kpis">${kpi('Closed', a.real_trades.closed)}${kpi('Win rate', a.real_trades.win_rate != null ? a.real_trades.win_rate + '%' : null)}
+            ${kpi('Avg R', a.real_trades.avg_r)}${kpi('P&L', swInr(a.real_trades.pnl))}</div>
+        <h4 class="sw-h4">Recent suggestions</h4>
+        <div class="sw-table-wrap"><table class="sw-table"><thead><tr><th>Date</th><th>Stock</th><th>Setup</th><th>Grade</th><th>Outcome</th>
+            <th class="r">Entry</th><th class="r">Fill</th><th class="r">Exit</th><th class="r">R</th><th class="r">Best / worst</th><th class="r">Days</th></tr></thead><tbody>
+            ${a.recent.map(r => `<tr><td>${swEsc(r.suggested_on)}</td><td><b>${swEsc(r.symbol)}</b>${r.top_pick ? ' ★' : ''}</td><td>${swEsc(r.setup)}</td><td>${swEsc(r.tier || '')}</td>
+                <td><span class="sw-out sw-out--${swEsc(r.status)}">${swEsc((r.status || '').replace('_', ' '))}</span></td>
+                <td class="r">${swRs(r.entry)}</td><td class="r">${swRs(r.fill)}</td><td class="r">${swRs(r.exit_price)}</td>
+                <td class="r ${r.r > 0 ? 'sw-pos' : r.r < 0 ? 'sw-neg' : ''}">${swR(r.r)}</td>
+                <td class="r sw-muted">${r.mfe_r != null ? `${swR(r.mfe_r)} / ${swR(r.mae_r)}` : '—'}</td><td class="r">${r.days_held ?? '—'}</td></tr>`).join('')
+                || '<tr><td colspan="11" class="sw-muted">Suggestions appear here from the first scan; outcomes fill in over the following days.</td></tr>'}
+        </tbody></table></div>`;
+}
+
+function swCurve(curve) {
+    const W = 700, H = 140, pad = 24;
+    const ys = curve.map(c => c.r);
+    const lo = Math.min(0, ...ys), hi = Math.max(0, ...ys);
+    const x = i => pad + i / (curve.length - 1) * (W - 2 * pad);
+    const y = v => pad / 2 + (hi - v) / ((hi - lo) || 1) * (H - pad);
+    const d = curve.map((c, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(c.r).toFixed(1)}`).join(' ');
+    return `<figure class="sw-curve"><figcaption>Cumulative result in R (closed suggestions, by exit date)</figcaption>
+        <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Cumulative R curve"><line x1="${pad}" x2="${W - pad}" y1="${y(0)}" y2="${y(0)}" class="sw-zero"/>
+        <path d="${d}" class="sw-curve-line"/><text x="${W - pad}" y="${y(ys[ys.length - 1]) - 6}" text-anchor="end" class="sw-lbl">${swR(ys[ys.length - 1])}</text></svg></figure>`;
+}
+
+// ── settings ──
+async function swOpenSettings() {
+    let s;
+    try { s = await swJson('/api/swing/settings'); } catch (e) { alert(e.message); return; }
+    const field = (k, label, help, step = 'any') => `<label title="${swEsc(help)}">${label}<input name="${k}" type="number" step="${step}" value="${s[k]}"></label>`;
+    swDialog(`<h3 id="sw-dialog-title">Risk settings</h3>
+        <p class="sw-muted">Position size = (capital × risk %) ÷ (entry − stop), capped by the max position %. In a CAUTION market the size is halved.</p>
+        <form id="sw-settings" class="sw-ticket" onsubmit="event.preventDefault(); swSaveSettings()">
+            ${field('capital', 'Trading capital ₹', 'Money set aside for swing trading')}
+            ${isAdminUser() ? '<button type="button" class="tf-btn sw-inline" onclick="swUseDhanFunds()">Use Dhan available balance</button>' : ''}
+            ${field('risk_per_trade_pct', 'Risk per trade %', 'A stop-out loses at most this % of capital. 0.5–1% is professional practice.')}
+            ${field('max_position_pct', 'Max position % of capital', 'Caps a single stock’s value')}
+            ${field('max_open_trades', 'Max open trades', '', 1)}
+            ${field('max_per_sector', 'Top picks per sector', 'Avoids concentration in one theme', 1)}
+            ${field('top_picks', 'Top picks shown', 'The action list never shows more than this', 1)}
+            ${field('earnings_block_days', 'Skip if results within (days)', 'Results can gap a stock through its stop', 1)}
+            ${field('min_turnover_cr', 'Min avg traded value (₹ Cr/day)', 'Liquidity filter: lower values mean more slippage')}
+            ${field('min_price', 'Min price ₹', '')}
+            <label class="sw-check"><input type="checkbox" name="auto_trail" ${s.auto_trail ? 'checked' : ''}> Move my Dhan stop-loss automatically when the trailing rule says so</label>
+            <div id="sw-settings-err" class="sw-alert sw-alert--err" hidden></div>
+            <footer class="sw-dialog-foot"><button type="button" class="tf-btn" onclick="swCloseDialog()">Cancel</button>
+                ${isAdminUser() ? '<button type="submit" class="tf-btn tf-btn--primary">Save</button>' : ''}</footer>
+        </form>`);
+}
+
+async function swUseDhanFunds() {
+    try {
+        const f = await swJson('/api/swing/funds');
+        const v = Math.floor(Number(f.available) || 0);
+        if (!v) { alert('Dhan reported no available balance'); return; }
+        document.querySelector('#sw-settings [name=capital]').value = v;
+    } catch (e) { alert(e.message); }
+}
+
+async function swSaveSettings() {
+    const f = document.getElementById('sw-settings');
+    const body = {};
+    for (const el of f.elements) {
+        if (!el.name) continue;
+        body[el.name] = el.type === 'checkbox' ? el.checked : el.value;
+    }
+    try {
+        await swJson('/api/swing/settings', { method: 'PUT', body: JSON.stringify(body) });
+        swCloseDialog();
+        await swLoadOverview();
+        swRender();
+    } catch (e) {
+        const err = document.getElementById('sw-settings-err');
+        err.hidden = false;
+        err.textContent = e.message;
+    }
 }
 
 // --- Initialize ---

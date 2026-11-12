@@ -1,150 +1,97 @@
-# Swing Trades Tab — Step-by-Step
+# Swing Trades tab
 
-This document explains what happens in the **Swing Trades** tab from UI → API → scan pipeline → UI updates.
+Three swing setups — **VCP**, **Flag** and **IPO base** — found every trading day, ranked so that only a
+handful are suggested, with execution on Dhan, automated trade management and an automated accuracy
+scorecard. Code lives in `backend/services/swing/`, the API in `backend/api/swing.py`.
 
-## 1) When the tab opens
-**Frontend**: `frontend/js/app.js`
-- `loadSignals('swing')` is called.
-- Fetches **GET** `/api/signals?section=swing`.
-- Renders the swing table, score tooltips, and last-updated info.
-- Status/score filter pills apply client-side filters (`loadSignals('swing', { statusFilters, scoreFilters })`).
+## Daily pipeline (`engine.py`)
 
-**Backend**: `backend/api/scanner.py` → `list_signals()`
-- Reads `Signal` rows for `section = swing`.
-- Adds F&O flags and lot size from `Instrument`.
-- Returns a flat list of signals for the UI.
+| Step | What | Cost |
+|---|---|---|
+| NSE intel | results / board-meeting calendar, ASM + GSM surveillance lists, bulk & block deals | 4 requests |
+| Bhavcopy | `sec_bhavdata_full_DDMMYYYY.csv`: official OHLC, volume, **delivery %** for every stock | 1 download / day |
+| Universe | EQ series, price ≥ `min_price`, 20-day avg traded value ≥ `min_turnover_cr`, not under ASM/GSM | none |
+| Candles | new stocks back-filled once from Dhan (~3 years), then appended from the bhavcopy | Dhan only for new names |
+| Detect | VCP / Flag / IPO detectors per stock, one frame in memory at a time | CPU only |
+| Rank | RS rating (percentile across the universe), market regime, sector rank + rotation, score 0–100 | none |
+| Persist | `swing_setups` lifecycle; the plan is frozen the first day it is suggested | — |
+| Accuracy | every frozen plan is replayed on the candles that followed | — |
 
-## 2) When you click “Scan Swing”
-**Frontend**: `runSwingScan()`
-- Calls **POST** `/api/settings/scan/run?section=swing`.
-- On success, refreshes the swing list via `loadSignals('swing')`.
+The first scan back-fills ~1,000 stocks (≈30 min, once). Afterwards a scan takes seconds.
+Splits/bonuses are detected from the bhavcopy's `PREV_CLOSE` and the stored history is rescaled.
 
-**Backend**: `backend/api/settings.py` → `run_scan(section='swing')`
-The swing scan is a **VCP (Volatility Contraction Pattern)** pipeline with sector-first prioritization:
+Schedule (`scheduler.py`): EOD scan 18:45 IST (retry 20:30 if the bhavcopy was late), then trade advice
+and the Telegram digest. During market hours every 2 min: fill detection, protection retries, exit
+detection, breakout alerts for top picks.
 
-1. **Sector analysis**
-   - Runs `SectorAnalyzer.analyze_sectors()` to get ranked sectors.
-   - Uses `sector.top_sectors` from `config.yaml` to select top momentum sectors.
+## Setups (`setups.py`)
 
-2. **Universe selection**
-   - Loads all NSE cash equities (`instrument_manager.get_nse_cash_equity_shares`).
-   - If `swing_universe.auto_rebuild_before_scan = true`, rebuilds `data/swing_universe_latest.csv` (liquidity-filtered universe).
-   - If `vcp_scanner.swing_universe_csv` exists, restricts the scan to those security IDs (CSV-based universe).
+All patterns are measured on data up to **yesterday**; today's bar only tests the breakout.
 
-3. **VCP scan**
-   - Calls `VCPScanner.scan_vcp_patterns(all_instruments, top_sectors)`.
-   - Stores signals in the DB and returns summary stats.
+* **VCP** — Stage-2 gate (price > rising 200-DMA, 50 > 200, within 25% of the 52-week high). Base of
+  15–130 days, ≤ 40% deep; zig-zag contractions that shrink (e.g. 18% → 9% → 4%), final ≤ 12%, right
+  side recovered to ≥ 85% of the base high. Entry = pivot + 0.2%; stop = low of the last contraction.
+* **Flag** — pole ≥ 15% in ≤ 20 days that reaches prior highs; flag of 3–15 days giving back ≤ 50% of
+  the pole, holding the 21-EMA, 50-DMA rising. Entry = high of the last ≤ 5 flag days; stop = flag low;
+  T2 includes the measured move (80% of the pole).
+* **IPO base** — listed ≤ 2 years (NSE IPO tracker / equity list), trading above the issue price, base
+  below the post-listing high ≤ 40% deep, last 10 days ≤ 18% range. Entry = break to a new all-time high.
 
-4. **Result payload**
-   - Returns `message` and `summary` (count scanned, signals found, skip reasons, etc.).
+Common plan rules: stop ≥ 1 ATR below entry (no noise stop-outs); a stop wider than 8% (9% for IPOs)
+marks the setup *wide* and it is never a top pick; T1 = 2R, T2 = max(3R, pattern target).
+Status: **triggered** (closed above entry today, ≤ 4% above), **ready** (≤ 3% below; 5% for IPOs),
+**forming** (3–10% below), **extended** (> 4% above — do not chase). An intraday poke above the pivot
+that closes back below is flagged as an *upthrust*.
 
-## 3) What the Swing table shows
-Each row is a signal with:
-- Symbol + occurrence number (1st/2nd/3rd time)
-- Signal type (VCP / Hybrid-VCP / Explosion, etc.)
-- Score (combined from trend + contraction + volume + position)
-- Dates: first detected + last updated
-- Status (Active/Exploded/Invalidated/Dismissed)
+## Score (0–100) and selection
 
-Hovering the score shows a **score breakdown tooltip** (trend/contraction/volume/position weights).
+| Component | Weight | Source |
+|---|---|---|
+| Pattern | 35 | detector quality (contractions, tightness, volume dry-up, retrace, …) |
+| Trend | 15 | Minervini trend template (7 checks) |
+| Relative strength | 15 | RS rating 1–99 (+ RS line at a new high) |
+| Sector | 15 | Sector Analysis rank + weekly rotation quadrant |
+| Smart money | 12 | up/down volume, delivery % trend, bulk/block deals, SMC (liquidity sweep, BOS, FVG, order block) |
+| Risk / room | 8 | stop distance, distance to the next resistance (none at all-time highs) |
 
-## 4) Signal detail panel
-Clicking a row opens the signal detail drawer:
-- Shows price levels, OHLC stats, and historical occurrences.
-- Uses **GET** `/api/signals/{id}` to fetch full signal history.
+Tiers: A+ ≥ 80, A ≥ 70, B ≥ 60. **Top picks** = ready/triggered, not wide, RS ≥ 60, no results within
+`earnings_block_days`, max `max_per_sector` per sector, at most `top_picks` names, and gated by the
+market regime: uptrend → A+/A, caution → A+ only, downtrend → none.
 
----
+**Market regime** (`regime.py`): Nifty vs 21-EMA / 50 / 200-DMA and slope (60 pts) + breadth of the
+universe (% above 50-DMA, 52-week highs vs lows, 40 pts). Position size ×1 / ×0.5 / blocked.
 
-## `config.yaml` settings used by Swing Trades
+## Trades (`trades.py`)
 
-### 1) `sector` (used to choose top sectors for swing scan)
-```
-sector:
-  top_sectors: 5
-  rs_periods: [5, 10, 20, 50]
-```
-- `top_sectors`: number of top momentum sectors to prioritize in the swing scan.
-- `rs_periods`: currently **not used** in code; RS timeframes are hard-coded in `sector_analyzer.py`.
+Modes: **paper** (tracked only), **gtt** (Dhan Forever Order BUY, trigger = entry, limit +0.5%: a buy-stop
+that never chases a big gap), **limit** (CNC limit now, AMO when closed). After the fill one **OCO GTT**
+(target + stop-loss, CNC) protects the position; it is retried every cycle and the trade shows
+UNPROTECTED (plus a Telegram alert) until it is live. eDIS authorisation is checked — without it (or
+DDPI) Dhan rejects the stop-loss sell.
 
-### 2) `swing_universe` (liquidity + universe rebuild)
-```
-swing_universe:
-  auto_rebuild_before_scan: true
-  min_ltp: 300
-  max_ltp: 5000
-  min_avg_daily_value_inr: 40000000
-  turnover_lookback_days: 20
-  history_calendar_days: 300
-  min_daily_rows: 115
-  hist_min_interval: 0.28
-  hist_chunk_pause: 0.18
-  ltp_batch_pause_sec: 2.0
-  ltp_batch_size: 1000
-  max_after_ltp: 0
-```
-- `auto_rebuild_before_scan`: rebuilds `swing_universe_latest.csv` before each scan.
-- `min_ltp` / `max_ltp`: price band for eligible stocks.
-- `min_avg_daily_value_inr`: minimum turnover (liquidity filter).
-- `turnover_lookback_days`: how many days to average turnover.
-- `history_calendar_days`: history window to fetch for filtering.
-- `min_daily_rows`: minimum candle count required.
-- `hist_min_interval` / `hist_chunk_pause`: throttling for Dhan historical calls.
-- `ltp_batch_pause_sec` / `ltp_batch_size`: pacing for LTP batch requests.
-- `max_after_ltp`: cap on post-LTP trimming (0 = no cap).
+Guards: stop < entry < target, stop ≤ 15% away, risk ≤ 3% of capital unless overridden, one open trade
+per stock, `max_open_trades`, live entries blocked in a downtrend unless overridden, buy-stop refused
+when the price is already above the entry, limit refused > 4% above the entry. Stops can only be raised.
 
-### 3) `vcp_scanner` (core Swing scoring logic)
-```
-vcp_scanner:
-  swing_scan_mode: chartink
-  swing_universe_csv: "data/swing_universe_latest.csv"
+End-of-day advice: failed breakout (close < entry −2% within 3 sessions → exit), close < 50-DMA on
+1.5× volume → exit, T1 → book half + stop to breakeven, +1.5R → breakeven, > 2R → trail under the
+21-EMA (10-EMA for flags) − ½ ATR, 10 sessions < +0.5R → time stop, results within 2 days → tighten.
+`auto_trail: true` applies stop moves to the Dhan GTT automatically.
 
-  chartink_near_high_threshold: 0.85
-  chartink_min_checks_to_pass: 0
-  chartink_must_pass_checks: []
-  chartink_weekly_range_max: 0.08
-  chartink_sma10_period: 10
-  chartink_sma15_period: 15
-  chartink_sma30_period: 30
-  chartink_sma40_period: 40
-  chartink_week_freq: W-FRI
-  chartink_drop_last_weekly_bar: true
-  chartink_volume_use_avg5: true
-  chartink_require_sma30_lag4: false
+## Accuracy (`evaluator.py`)
 
-  min_price: 300
-  max_price: 5000
-  min_volume: 5000
-  near_high_threshold: 0.85
-  ma_fast: 12
-  ma_mid: 24
-  ma_slow: 48
-  contraction_thresholds: [0.15, 0.10, 0.05]
-  min_contractions_weekly: 3
-  min_contractions_daily: 3
-  contraction_lookback_weeks: 20
-  contraction_lookback_days: 30
-  volume_surge_threshold: 1.4
-  volume_dryup_threshold: 0.8
-  rs_threshold: 70
-  min_score_threshold: 0.45
-  weight_trend: 0.22
-  weight_contraction: 0.32
-  weight_volume: 0.18
-  weight_price_position: 0.18
-  weight_rs: 0.10
-```
-Key notes:
-- `swing_scan_mode`: `chartink` (default) or `minervini` logic.
-- `swing_universe_csv`: CSV used to restrict the universe (if present).
-- `chartink_*` fields: thresholds for the ChartInk-style VCP screen.
-- `min_price`/`max_price`/`min_volume`: additional filters in the Minervini mode.
-- `contraction_*`, `volume_*`, `weight_*`: scoring logic for VCP quality.
+Suggested plans (ready/triggered, grade ≥ B, not wide) are replayed honestly: gap-up fills at the open,
+gap-down through the stop fills at the open, stop first if stop and target hit the same day, invalidated
+(not a loss) if the stop breaks before the trigger, trigger window 10 sessions, half at T1 then breakeven,
+time stop 30 sessions. Results in R, plus MFE/MAE. The Scorecard groups them by setup, grade and regime
+and labels the edge (needs ≥ 15 closed): positive (avg ≥ 0.25R), thin, negative.
 
----
+## Settings
 
-## API Summary
-- **GET** `/api/signals?section=swing` → list swing signals
-- **GET** `/api/signals/{id}` → signal detail + history
-- **POST** `/api/settings/scan/run?section=swing` → run swing scan
+`config.yaml` → `swing:` (see `config.yaml.example`), overridden from the tab (Risk settings →
+`data/swing/settings.json`). Detector thresholds: `swing.setup_params`.
 
----
+## Files
+
+`data/swing/candles/*.pkl` (candle store + `_meta.json`), `data/swing/nse/` (bhavcopies, equity list,
+intel), `data/swing/last_run.json`, `data/swing/settings.json`.

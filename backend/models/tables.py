@@ -230,7 +230,82 @@ class Trade(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # Swing (cash equity) trades
+    setup_id = Column(Integer, ForeignKey("swing_setups.id"), nullable=True, index=True)
+    setup_type = Column(String(10))          # VCP / FLAG / IPO / MANUAL
+    entry_mode = Column(String(10))          # gtt (buy-stop) / limit / paper
+    initial_sl = Column(Float)
+    t1_price = Column(Float)
+    t1_done = Column(Boolean, default=False)
+    peak_price = Column(Float)
+    exit_reason = Column(String(60))
+    advice = Column(Text)                    # JSON: latest management advice
+    protection_note = Column(String(200))
+
     signal = relationship("Signal", back_populates="trades")
+
+
+class SwingSetup(Base):
+    """One lifecycle of a swing setup (VCP / FLAG / IPO) on one stock, plus its forward-tested outcome."""
+
+    __tablename__ = "swing_setups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    security_id = Column(String(20), nullable=False, index=True)
+    symbol = Column(String(50), nullable=False)
+    name = Column(String(120))
+    setup_type = Column(String(10), nullable=False)       # VCP / FLAG / IPO
+    status = Column(String(16), nullable=False)           # forming / ready / triggered / extended / invalidated / expired
+    active = Column(Boolean, default=True, nullable=False)
+    tier = Column(String(3))                              # A+ / A / B / C
+    score = Column(Float, default=0.0)
+    components = Column(Text)                             # JSON score breakdown
+    reasons = Column(Text)                                # JSON list
+    warnings = Column(Text)                               # JSON list
+    detail = Column(Text)                                 # JSON: levels, metrics, smc, chart
+    sector = Column(String(50))
+    sector_rank = Column(Integer)
+    rs_rating = Column(Integer)
+    regime = Column(String(12))
+    close = Column(Float)
+    entry = Column(Float)
+    stop = Column(Float)
+    target1 = Column(Float)
+    target2 = Column(Float)
+    risk_pct = Column(Float)
+    top_pick = Column(Boolean, default=False)
+    dismissed = Column(Boolean, default=False)
+    first_seen = Column(Date, nullable=False)
+    last_seen = Column(Date, nullable=False)
+
+    # Frozen plan at the moment it was first suggested (ready/triggered) -> accuracy tracking
+    suggested_on = Column(Date, index=True)
+    plan_entry = Column(Float)
+    plan_stop = Column(Float)
+    plan_t1 = Column(Float)
+    plan_t2 = Column(Float)
+    plan_score = Column(Float)
+    plan_tier = Column(String(3))
+    plan_regime = Column(String(12))
+    plan_top_pick = Column(Boolean, default=False)
+    eval_status = Column(String(16), index=True)          # pending/no_trigger/invalidated/open/win/loss/breakeven/timeout
+    triggered_on = Column(Date)
+    fill_price = Column(Float)
+    exit_on = Column(Date)
+    exit_price = Column(Float)
+    result_r = Column(Float)
+    mfe_r = Column(Float)
+    mae_r = Column(Float)
+    days_held = Column(Integer)
+    t1_hit = Column(Boolean, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_swing_active", "active", "setup_type"),
+        Index("idx_swing_sec_type", "security_id", "setup_type", "active"),
+    )
 
 
 class ValueCandidate(Base):

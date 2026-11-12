@@ -764,6 +764,61 @@ class DhanClient:
             logger.error(f"Cancel order error: {e}")
             return {"error": True, "detail": str(e)}
 
+    async def modify_forever_order(
+        self,
+        order_id: str,
+        *,
+        order_flag: str,
+        leg_name: str,
+        order_type: str,
+        quantity: int,
+        price: float,
+        trigger_price: float,
+        validity: str = "DAY",
+    ) -> Optional[dict]:
+        """Modify one leg of a forever (GTT) order. leg_name: TARGET_LEG or STOP_LOSS_LEG."""
+        client = await self._get_client()
+        payload = {
+            "dhanClientId": self.client_id, "orderId": str(order_id), "orderFlag": order_flag,
+            "orderType": order_type, "legName": leg_name, "quantity": int(quantity),
+            "price": price, "triggerPrice": trigger_price, "validity": validity,
+        }
+        try:
+            response = await client.put(f"/forever/orders/{order_id}", json=payload)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Forever order modify failed: {e.response.status_code} - {e.response.text}")
+            return {"error": True, "status_code": e.response.status_code, "detail": e.response.text}
+        except Exception as e:
+            logger.error(f"Forever order modify error: {e}")
+            return {"error": True, "detail": str(e)}
+
+    async def _get_json(self, path: str, label: str):
+        client = await self._get_client()
+        try:
+            response = await client.get(path)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"{label} error: {e}")
+            return None
+
+    async def get_holdings(self) -> Optional[list]:
+        """Demat holdings (securityId, isin, totalQty, availableQty, avgCostPrice, ...)."""
+        return await self._get_json("/holdings", "Holdings")
+
+    async def get_positions(self) -> Optional[list]:
+        return await self._get_json("/positions", "Positions")
+
+    async def get_fund_limit(self) -> Optional[dict]:
+        """Fund limits (availabelBalance [sic], utilizedAmount, withdrawableBalance, ...)."""
+        return await self._get_json("/fundlimit", "Fund limit")
+
+    async def edis_inquire(self, isin: str) -> Optional[dict]:
+        """eDIS status for a holding: how many shares are pre-authorised for selling (aprvdQty)."""
+        return await self._get_json(f"/edis/inquire/{isin}", "eDIS inquiry")
+
     async def renew_token(self) -> Optional[dict]:
         """Renew the access token using Dhan's RenewToken endpoint."""
         client = await self._get_client()

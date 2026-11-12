@@ -83,6 +83,11 @@
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h4l3-9 4 18 3-9h4"/></svg>
                         <span>Swing Trades</span>
                     </div>
+                    <div class="nav-sub-sub" data-parent="swing" role="group" aria-label="Swing setups">
+                        <button type="button" onclick="openSwing('VCP')">VCP setup</button>
+                        <button type="button" onclick="openSwing('FLAG')">Flag setup</button>
+                        <button type="button" onclick="openSwing('IPO')">IPO setup</button>
+                    </div>
                     <div onclick="switchTab('value')" id="tab-value" class="nav-item nav-sub-item">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M4 7h16M4 12h16M4 17h16"/><path d="M8 3v18"/>
@@ -449,57 +454,35 @@
 
         <!-- Swing Trades Tab -->
         <section id="content-swing" class="tab-content hidden flex flex-col flex-1 overflow-hidden">
-            <div class="flex items-center justify-between mb-2 flex-shrink-0">
-                <div class="flex items-center gap-2">
-                    <h2 class="text-xs font-bold" style="color:var(--text-heading)">Enhanced VCP Scanner</h2>
-                    <span class="text-2xs" style="color:var(--text-muted)">Progressive Contractions • Sector-First • Volume Analysis</span>
-                </div>
-                <div class="flex items-center gap-3">
-                    <div class="filter-pills" id="swing-status-filter">
-                        <button class="filter-pill" data-value="" onclick="togglePill(this,'swing')">All</button>
-                        <button class="filter-pill active" data-value="active" onclick="togglePill(this,'swing')">Active</button>
-                        <button class="filter-pill" data-value="exploded" onclick="togglePill(this,'swing')">Exploded</button>
-                        <button class="filter-pill" data-value="invalidated" onclick="togglePill(this,'swing')">Invalid</button>
-                        <button class="filter-pill" data-value="dismissed" onclick="togglePill(this,'swing')">Dismissed</button>
+            <div class="sw-root">
+                <header class="sw-head">
+                    <div class="sw-title">
+                        <h2>Swing Trades</h2>
+                        <p>VCP · Flag · IPO base &mdash; strong stocks in strong sectors, bought at the breakout with a tight stop</p>
                     </div>
-                    <div class="filter-pills" id="swing-score-filter">
-                        <button class="filter-pill active" data-value="" onclick="togglePill(this,'swing')">Any</button>
-                        <button class="filter-pill" data-value="60" onclick="togglePill(this,'swing')">&gt;60%</button>
-                        <button class="filter-pill" data-value="70" onclick="togglePill(this,'swing')">&gt;70%</button>
-                        <button class="filter-pill" data-value="80" onclick="togglePill(this,'swing')">&gt;80%</button>
+                    <div class="sw-head-right">
+                        <span id="sw-regime-chip" class="sw-chip">Market: —</span>
+                        <span id="sw-asof" class="sw-muted"></span>
+                        <button type="button" class="tf-btn" onclick="swOpenSettings()" title="Capital and risk per trade (used for position size)">Risk settings</button>
+                        <button type="button" id="sw-scan-btn" class="tf-btn tf-btn--primary" onclick="swScan()">Run scan</button>
                     </div>
-                    <button onclick="runSwingScan()" id="btn-swing-scan" class="btn-primary px-3 py-1 rounded-lg text-2xs" title="Run new VCP scan to find patterns">
-                        🔍 Scan VCP
-                    </button>
-                    <div class="h-4 w-px" style="background:rgba(255,255,255,0.1)"></div>
-                    <button onclick="refreshSwingSignals()" id="btn-refresh-swing" class="btn-secondary px-3 py-1 rounded-lg text-2xs" title="Refresh signals and prices">
-                        ↻ Refresh
-                    </button>
-                </div>
+                </header>
+                <div id="sw-progress" class="sw-progress" hidden><div class="sw-progress-bar"><i id="sw-progress-fill"></i></div><span id="sw-progress-text"></span></div>
+                <nav class="sw-tabs" role="tablist" aria-label="Swing views">
+                    <button type="button" role="tab" data-view="picks" onclick="swView('picks')">Top picks <b id="sw-n-picks"></b></button>
+                    <button type="button" role="tab" data-view="VCP" onclick="swView('VCP')">VCP setup <b id="sw-n-VCP"></b></button>
+                    <button type="button" role="tab" data-view="FLAG" onclick="swView('FLAG')">Flag setup <b id="sw-n-FLAG"></b></button>
+                    <button type="button" role="tab" data-view="IPO" onclick="swView('IPO')">IPO setup <b id="sw-n-IPO"></b></button>
+                    <button type="button" role="tab" data-view="trades" onclick="swView('trades')">My trades <b id="sw-n-trades"></b></button>
+                    <button type="button" role="tab" data-view="score" onclick="swView('score')">Scorecard</button>
+                </nav>
+                <div id="sw-body" class="sw-body"></div>
             </div>
 
-            <!-- VCP Pattern Info Panel -->
-            <div id="vcp-info-panel" class="hidden mb-3 p-3 rounded-lg flex-shrink-0" style="background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.2)">
-                <div class="flex items-center justify-between">
-                    <div class="flex items-center gap-4">
-                        <div class="flex items-center gap-2">
-                            <span class="text-xs font-medium" style="color:#22c55e">VCP Criteria:</span>
-                            <span class="text-2xs" style="color:var(--text-muted)">Progressive contractions (15%→10%→5%) • Volume dry-up • Near 52-week highs • Strong sectors</span>
-                        </div>
-                    </div>
-                    <div class="flex items-center gap-3">
-                        <span id="swing-scan-status" class="text-2xs" style="color:var(--text-muted)"></span>
-                        <span id="swing-last-updated" class="text-2xs" style="color:var(--text-muted)"></span>
-                        <button onclick="toggleVcpInfo()" class="text-2xs px-2 py-1 rounded" style="background:rgba(34,197,94,0.2);color:#22c55e">Hide Info</button>
-                    </div>
-                </div>
-            </div>
-            <div id="swing-signals-table" class="glass-card overflow-auto flex-1">
-                <div class="p-10 text-center" style="color:var(--text-muted)">
-                    <p class="text-sm mb-1">No signals yet</p>
-                    <p class="text-xs">Run your first scan from Settings, or wait for the scheduled scan.</p>
-                </div>
-            </div>
+            <dialog id="sw-dialog" class="sw-dialog" aria-labelledby="sw-dialog-title">
+                <form method="dialog" class="sw-dialog-x"><button aria-label="Close">&times;</button></form>
+                <div id="sw-dialog-body"></div>
+            </dialog>
         </section>
 
         <!-- F&O Tab -->

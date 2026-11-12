@@ -227,6 +227,60 @@ async def _run_order_safety_jobs():
         db.close()
 
 
+async def _run_swing_eod():
+    """After the NSE bhavcopy is published: swing scan, accuracy update, trade advice, Telegram digest."""
+    if not is_market_day():
+        return
+    from backend.models.database import get_session_factory
+    from backend.services.dhan_client import DhanClient
+    from backend.services.swing import engine, trades
+    from backend.services.swing.notify import send_swing_digest
+
+    last = engine.load_last_run()
+    from backend.services.market_calendar import today_ist
+
+    if last.get("as_of") == today_ist().isoformat() and last.get("ok"):
+        return                      # today's bhavcopy already processed (retry slot)
+    db = get_session_factory()()
+    client = DhanClient()
+    try:
+        summary = await engine.SwingEngine(db, dhan=client).run()
+        advice = await trades.manage_eod(db, client, engine.CandleStore())
+        if summary.get("ok") and summary.get("as_of") == today_ist().isoformat():
+            await send_swing_digest(db, summary, advice)
+        logger.info("Swing EOD: %s", {k: summary.get(k) for k in ("ok", "as_of", "setups", "top_picks", "seconds")})
+    except Exception as e:
+        logger.error("Swing EOD failed: %s", e, exc_info=True)
+    finally:
+        await client.close()
+        db.close()
+
+
+async def _run_swing_intraday():
+    """Market hours: swing fills / protection / exits, and breakout alerts for top picks."""
+    from backend.services.market_calendar import is_market_open
+
+    if not is_market_open():
+        return
+    from backend.models.database import get_session_factory
+    from backend.services.dhan_client import DhanClient
+    from backend.services.swing import trades
+    from backend.services.swing.notify import watch_triggers
+
+    db = get_session_factory()()
+    client = DhanClient()
+    try:
+        events = await trades.monitor(db, client)
+        if events:
+            logger.info("Swing monitor: %s", events)
+        await watch_triggers(db, client)
+    except Exception as e:
+        logger.error("Swing intraday job failed: %s", e, exc_info=True)
+    finally:
+        await client.close()
+        db.close()
+
+
 async def _run_daily_ipo_refresh():
     """Roll IPO all-time highs forward after the close (incremental, one candle call per stock)."""
     if not is_market_day():
@@ -381,6 +435,21 @@ def start_scheduler():
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+    )
+
+    # Swing: EOD scan once NSE publishes the bhavcopy (~6 PM); 8:30 PM retries if it was late.
+    for job_id, hh, mm in (("swing_eod", 18, 45), ("swing_eod_retry", 20, 30)):
+        _scheduler.add_job(
+            _run_swing_eod,
+            CronTrigger(day_of_week="mon-fri", hour=hh, minute=mm, timezone="Asia/Kolkata"),
+            id=job_id, name=f"Swing EOD scan ({hh}:{mm:02d})",
+            replace_existing=True, max_instances=1, coalesce=True,
+        )
+    _scheduler.add_job(
+        _run_swing_intraday,
+        CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/2", timezone="Asia/Kolkata"),
+        id="swing_intraday", name="Swing trades monitor (2 min)",
+        replace_existing=True, max_instances=1, coalesce=True,
     )
 
     _scheduler.start()

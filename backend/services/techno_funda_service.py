@@ -36,7 +36,7 @@ from backend.services.techno_funda_fundamental import analyze_fundamentals
 from backend.services.techno_funda_business import build_business
 from backend.services.techno_funda_sources import (
     ScreenerSource, TickertapeSource, WikipediaSource, YahooPrices, fetch_markdown, fetch_screener_peers,
-    split_markdown_sections,
+    merge_live_candle, missing_sessions, parse_dhan_quote, split_markdown_sections,
 )
 from backend.services.techno_funda_technical import analyze_technicals
 
@@ -258,9 +258,12 @@ class TechnoFundaService:
         bse_code = (((raw.get("profile") or {}).get("data") or {}).get("company") or {}).get("bse_code")
         prices, bench, price_source, price_note = await self._fetch_prices(instrument, tt_symbol, bse_code)
 
+        price_info = _price_info(prices, raw, price_source)
+
         from backend.services.value_investing_service import ValueInvestingService  # reuse fair-value / DCF math
         fundamental = analyze_fundamentals(raw, valuation_helper=ValueInvestingService(self.db),
-                                           gsec_yield=self.gsec_yield, prices=prices)
+                                           gsec_yield=self.gsec_yield, prices=prices,
+                                           live_price=price_info.get("price") if price_info.get("is_quote") else None)
         if not fundamental.get("available") and fmeta.get("message"):
             fundamental["reason"] = fmeta["message"]
         technical = analyze_technicals(prices, bench)
@@ -272,7 +275,8 @@ class TechnoFundaService:
         verdict = self._verdict(fundamental, technical)
         company = fundamental.get("company") or {}
         valuation = fundamental.get("valuation") or {}
-        live_px = technical.get("last_close") if str(price_source).startswith(("Dhan", "Yahoo")) else None
+        if technical.get("available"):
+            technical["live_candle"] = bool(prices is not None and prices.attrs.get("live_candle"))
         display_symbol = tt_symbol if _is_isin(symbol) and not _is_isin(tt_symbol) else symbol
         result = {
             "symbol": display_symbol,
@@ -284,7 +288,8 @@ class TechnoFundaService:
             "isin": company.get("isin") or (instrument.isin if instrument else None),
             "sector": company.get("sector") or (instrument.sector if instrument else None),
             "industry": company.get("industry"),
-            "price": live_px or valuation.get("price") or technical.get("last_close"),
+            "price": price_info.get("price") or valuation.get("price") or technical.get("last_close"),
+            "price_info": price_info,
             "quote": ((raw.get("profile") or {}).get("data") or {}).get("quote"),
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "elapsed_sec": round(time.time() - started, 1),
@@ -626,6 +631,8 @@ class TechnoFundaService:
                         bench = await client.get_historical_daily_data(
                             security_id=self._nifty_security_id(), exchange_segment="IDX_I",
                             instrument="INDEX", from_date=from_d, to_date=to_d)
+                        # Daily candles stop at yesterday during market hours: add today's from live quotes.
+                        df, bench = await self._apply_live_quotes(client, str(instrument.security_id), df, bench)
                 finally:
                     await client.close()
             except Exception as e:
@@ -639,7 +646,7 @@ class TechnoFundaService:
                     bench = await yahoo.daily("^NSEI", yrange)
                 except Exception as e:
                     logger.info("Yahoo NIFTY history unavailable: %s", e)
-            return df, bench, "Dhan historical (daily, 2 years)", None
+            return df, bench, "Dhan historical (daily, 2 years)" + (" + live quote" if df.attrs.get("live_candle") else ""), None
 
         # Yahoo: NSE listing, then BSE code
         for ysym in [f"{ticker}.NS"] + ([f"{bse_code}.BO"] if bse_code else []):
@@ -652,9 +659,18 @@ class TechnoFundaService:
                         bench = await yahoo.daily("^NSEI", yrange)
                     except Exception:
                         bench = None
-                    note = ("Dhan history unavailable (its access token looks expired), so candles come from Yahoo Finance."
-                            if instrument is not None else None)
-                    return ydf, bench, f"Yahoo Finance ({ysym}, daily)", note
+                    notes = []
+                    if instrument is not None:
+                        from backend.services.token_manager import current_token
+
+                        notes.append(("Dhan rejected the access token (expired or revoked)" if current_token()
+                                      else "No Dhan access token is loaded") + ", so candles come from Yahoo Finance. "
+                                     "Renew it in Settings → Access token.")
+                    gaps = missing_sessions(ydf)
+                    if gaps:
+                        notes.append(f"Yahoo is missing {len(gaps)} recent trading session(s) ({', '.join(gaps[-4:])}); "
+                                     "indicators may be slightly off.")
+                    return ydf, bench, f"Yahoo Finance ({ysym}, daily)", " ".join(notes) or None
             except Exception as e:
                 logger.info("Yahoo history unavailable for %s: %s", ysym, e)
 
@@ -678,6 +694,28 @@ class TechnoFundaService:
         finally:
             await client.close()
         return None, None, "unavailable", "No price history from Dhan, Yahoo or Tapetide."
+
+    async def _apply_live_quotes(self, client, security_id: str, df, bench):
+        """One /marketfeed/quote call per segment; merges today's provisional candle into both series."""
+        live = None
+        try:
+            q = parse_dhan_quote(await client.get_market_quote_quote([security_id], "NSE_EQ"), "NSE_EQ", security_id)
+            if q:
+                df, added = merge_live_candle(df, q)
+                live = {**q, "source": "Dhan live quote", "candle_added": added}
+                df.attrs["live"] = live
+                df.attrs["live_candle"] = added
+        except Exception as e:
+            logger.info("Dhan live quote unavailable for %s: %s", security_id, e)
+        if bench is not None and not bench.empty:
+            try:
+                nid = self._nifty_security_id()
+                qn = parse_dhan_quote(await client.get_market_quote_quote([nid], "IDX_I"), "IDX_I", nid)
+                if qn:
+                    bench, _ = merge_live_candle(bench, qn)
+            except Exception as e:
+                logger.info("Dhan NIFTY quote unavailable: %s", e)
+        return df, bench
 
     @staticmethod
     def _nifty_security_id() -> str:
@@ -766,6 +804,70 @@ class TechnoFundaService:
             "positives": positives[:6], "negatives": negatives[:6], "triggers": triggers,
             "weights": {"fundamental": wf, "technical": wt},
         }
+
+
+def _price_info(prices, raw: dict, price_source: str) -> dict:
+    """What price is shown and how fresh it is, plus a cross-check against Screener's quoted price."""
+    from backend.services.market_calendar import is_market_open
+
+    info: dict[str, Any] = {"price": None, "source": None, "as_of": None, "is_quote": False, "is_live": False, "delayed": False,
+                            "prev_close": None, "prev_close_date": None, "change": None, "change_pct": None,
+                            "market_open": is_market_open(), "warnings": []}
+    if prices is None or len(prices) == 0:
+        return info
+    live = prices.attrs.get("live") or {}
+    ts = pd.to_datetime(prices["timestamp"])
+    last_close = float(prices["close"].iloc[-1])
+    if live.get("ltp"):
+        info.update(price=float(live["ltp"]), source=live.get("source"), is_quote=True,
+                    as_of=live["ts"].isoformat(timespec="minutes") if live.get("ts") else None)
+        # "Live" only for Dhan's real-time quote; Yahoo can lag ~15 minutes.
+        info["is_live"] = bool(str(live.get("source", "")).startswith("Dhan") and info["market_open"]
+                               and live.get("ts") and live["ts"].date() == datetime.now().date())
+        info["delayed"] = not str(live.get("source", "")).startswith("Dhan")
+        # previous official close = last candle strictly before the quote's day
+        qd = pd.Timestamp(live["ts"]).normalize() if live.get("ts") else ts.iloc[-1].normalize()
+        prev = prices[ts.dt.normalize() < qd]
+        if live.get("prev_close"):
+            info["prev_close"] = float(live["prev_close"])
+        elif len(prev):
+            info["prev_close"] = float(prev["close"].iloc[-1])
+        if len(prev):
+            info["prev_close_date"] = prev["timestamp"].iloc[-1].strftime("%Y-%m-%d")
+            candle_prev = float(prev["close"].iloc[-1])
+            if info["prev_close"] and abs(candle_prev / info["prev_close"] - 1) > 0.005:
+                info["warnings"].append(f"Previous close differs between the quote (₹{info['prev_close']:,.2f}) and the "
+                                        f"daily candles (₹{candle_prev:,.2f}); possible corporate action — verify.")
+    else:
+        info.update(price=last_close, source=f"Last daily close ({price_source})",
+                    as_of=ts.iloc[-1].strftime("%Y-%m-%d"))
+        if len(prices) > 1:
+            info["prev_close"] = float(prices["close"].iloc[-2])
+            info["prev_close_date"] = ts.iloc[-2].strftime("%Y-%m-%d")
+        if info["market_open"]:
+            info["warnings"].append("Market is open but no live quote was available: the price shown is the last "
+                                    "daily close, not the current price.")
+    # The change is only meaningful against the PREVIOUS TRADING DAY's close. Yahoo sometimes misses
+    # sessions (e.g. no 11-Nov-2026 candle); then the last candle it has is older and the change is wrong.
+    if info["prev_close"] and info["prev_close_date"] and not live.get("prev_close"):
+        from backend.services.market_calendar import is_trading_day
+
+        ref = (pd.Timestamp(live["ts"]).date() if live.get("ts") else ts.iloc[-1].date())
+        expected = ref - timedelta(days=1)
+        while not is_trading_day(expected):
+            expected -= timedelta(days=1)
+        if info["prev_close_date"] != expected.isoformat():
+            info["warnings"].append(f"Previous close for {expected.isoformat()} is missing from {info['source'] or 'the data'}, "
+                                    f"so the day's change is not shown (the last close available is {info['prev_close_date']}).")
+            info["prev_close"] = info["prev_close_date"] = None
+    if info["price"] and info["prev_close"]:
+        info["change"] = round(info["price"] - info["prev_close"], 2)
+        info["change_pct"] = round((info["price"] / info["prev_close"] - 1) * 100, 2)
+    scr = ((((raw.get("profile") or {}).get("data") or {}).get("price_metrics")) or {}).get("price")
+    if scr and info["price"] and abs(float(scr) / info["price"] - 1) > 0.03:
+        info["warnings"].append(f"Screener's quoted price (₹{float(scr):,.2f}) differs from the price used here "
+                                f"(₹{info['price']:,.2f}) by more than 3%; ratios are computed at ₹{info['price']:,.2f}.")
+    return info
 
 
 _SOURCE_NAMES = {"screener": "Screener.in", "tickertape": "Tickertape", "tapetide": "Tapetide MCP", "wikipedia": "Wikipedia"}

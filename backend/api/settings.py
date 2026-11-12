@@ -790,14 +790,20 @@ async def disable_pnl_exit():
 
 
 @router.get("/token/status")
-def dhan_token_status():
-    """Whether an access token is loaded and how the last renewal went (never the token)."""
-    from backend.services.token_manager import current_token, last_result
+async def dhan_token_status():
+    """Whether a token is loaded, whether Dhan accepts it, and how the last renewal went (never the token)."""
+    from backend.services.token_manager import current_token, last_result, token_health
 
     last = last_result()
+    health = await token_health()
     return {
         "has_token": bool(current_token()),
-        "last": {k: last.get(k) for k in ("success", "action", "method", "at")},
+        "valid": health.get("valid"),
+        "reason": health.get("reason"),
+        "hours_left": health.get("hours_left"),
+        # Never the free-text message; per-method reasons are redacted (no token, PIN or TOTP) by dhan_client.
+        "last": {**{k: last.get(k) for k in ("success", "action", "method", "at")},
+                 **({"reasons": last.get("reasons") or []} if last.get("action") == "failed" else {})},
     }
 
 

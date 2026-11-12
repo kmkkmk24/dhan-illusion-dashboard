@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import httpx
@@ -562,6 +562,66 @@ class YahooPrices:
             return parse_yahoo_chart(r.json())
 
 
+def parse_dhan_quote(payload: Optional[dict], segment: str, security_id: str) -> Optional[dict]:
+    """Dhan /marketfeed/quote → {ltp, open, high, low, volume, prev_close, ts} (ts = naive IST)."""
+    try:
+        d = ((payload or {}).get("data") or {}).get(segment, {}).get(str(security_id)) or {}
+    except AttributeError:
+        return None
+    ltp = _num(d.get("last_price"))
+    if not ltp:
+        return None
+    ohlc = d.get("ohlc") or {}
+    ts = None
+    if d.get("last_trade_time"):
+        try:
+            ts = datetime.strptime(str(d["last_trade_time"]), "%d/%m/%Y %H:%M:%S")
+        except ValueError:
+            ts = None
+    return {"ltp": ltp, "open": _num(ohlc.get("open")), "high": _num(ohlc.get("high")), "low": _num(ohlc.get("low")),
+            "prev_close": _num(ohlc.get("close")), "volume": _num(d.get("volume")), "ts": ts,
+            "high_52w": _num(d.get("52_week_high")), "low_52w": _num(d.get("52_week_low"))}
+
+
+def merge_live_candle(df: Optional[pd.DataFrame], q: Optional[dict]) -> tuple[Optional[pd.DataFrame], bool]:
+    """Append today's in-progress candle from a live quote.
+
+    Dhan's daily-candle API only returns a day after the close, so during market hours the last row is
+    yesterday. If the quote is for a later date than the last candle, add a provisional candle
+    (close = LTP). Once the official daily candle exists, it is kept and the quote is ignored.
+    """
+    if df is None or df.empty or not q or not q.get("ltp") or not q.get("ts"):
+        return df, False
+    qd = pd.Timestamp(q["ts"]).normalize()
+    last = pd.Timestamp(df["timestamp"].iloc[-1]).normalize()
+    if qd <= last:
+        return df, False
+    ltp = float(q["ltp"])
+    o = float(q.get("open") or ltp)
+    row = {"timestamp": qd, "open": o, "high": max(float(q.get("high") or ltp), ltp, o),
+           "low": min(float(q.get("low") or ltp), ltp, o), "close": ltp, "volume": float(q.get("volume") or 0)}
+    out = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    out.attrs = dict(df.attrs)
+    return out, True
+
+
+def missing_sessions(df: Optional[pd.DataFrame], lookback_days: int = 30) -> list[str]:
+    """Trading days (per the NSE calendar) absent from a candle series, e.g. Yahoo gaps."""
+    if df is None or df.empty:
+        return []
+    from backend.services.market_calendar import is_trading_day, today_ist
+
+    have = set(pd.to_datetime(df["timestamp"]).dt.date)
+    end = today_ist() - timedelta(days=1)
+    start = max(end - timedelta(days=lookback_days), min(have))
+    out, d = [], start
+    while d <= end:
+        if is_trading_day(d) and d not in have:
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
 def parse_yahoo_chart(payload: dict) -> Optional[pd.DataFrame]:
     res = ((payload or {}).get("chart") or {}).get("result") or []
     if not res:
@@ -576,4 +636,11 @@ def parse_yahoo_chart(payload: dict) -> Optional[pd.DataFrame]:
         "open": q.get("open"), "high": q.get("high"), "low": q.get("low"), "close": q.get("close"), "volume": q.get("volume"),
     })
     df = df.dropna(subset=["close"]).drop_duplicates("timestamp", keep="last").reset_index(drop=True)
-    return df if not df.empty else None
+    if df.empty:
+        return None
+    meta = r0.get("meta") or {}
+    if meta.get("regularMarketPrice") and meta.get("regularMarketTime"):
+        ts = pd.Timestamp(meta["regularMarketTime"], unit="s", tz="UTC").tz_convert("Asia/Kolkata").tz_localize(None)
+        df.attrs["live"] = {"ltp": float(meta["regularMarketPrice"]), "ts": ts.to_pydatetime(),
+                            "source": "Yahoo Finance (can lag by up to ~15 minutes)"}
+    return df

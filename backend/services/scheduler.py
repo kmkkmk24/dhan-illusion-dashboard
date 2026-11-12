@@ -11,7 +11,7 @@ Schedule:
 
 import asyncio
 import logging
-from datetime import datetime, date
+from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -39,6 +39,17 @@ async def _refresh_dhan_token():
 
     result = await ensure_valid_token()
     logger.info("Token check: %s", {k: v for k, v in result.items() if k != "message"})
+
+
+async def _verify_market_calendar():
+    """Startup self-check: holidays vs the sessions NIFTY actually traded (logs an error on mismatch).
+    A wrong holiday makes order flows send AMOs on live days and skips protection jobs."""
+    from backend.services.market_calendar import verify_with_dhan
+
+    try:
+        await verify_with_dhan()
+    except Exception as e:
+        logger.warning("Market calendar self-check skipped: %s", e)
 
 
 async def _run_scheduled_fno_scan():
@@ -319,6 +330,14 @@ def start_scheduler():
         run_date=datetime.now(),
         id="token_startup_check",
         name="Dhan token startup check",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        _verify_market_calendar,
+        "date",
+        run_date=datetime.now() + timedelta(seconds=60),  # after the token check
+        id="calendar_startup_check",
+        name="NSE calendar self-check",
         replace_existing=True,
     )
 

@@ -778,20 +778,20 @@ class DhanClient:
             response.raise_for_status()
             result = response.json()
             
-            if "accessToken" in result:
-                new_token = result["accessToken"]
+            new_token = _extract_token(result)
+            if new_token:
                 logger.info("Successfully renewed Dhan access token")
                 return {"success": True, "new_token": new_token, "expires_in": "24h"}
-            else:
-                logger.error(f"Token renewal failed: {result}")
-                return {"success": False, "error": "No accessToken in response"}
-                
+            logger.error("Token renewal failed: %s", _dhan_error_text(result))
+            return {"success": False, "error": f"no token in response ({_dhan_error_text(result)})"}
+
         except httpx.HTTPStatusError as e:
-            logger.error(f"Token renewal HTTP error: {e.response.status_code} - {e.response.text}")
-            return {"success": False, "error": f"HTTP {e.response.status_code}", "detail": e.response.text}
+            err = _dhan_error_text(e.response)
+            logger.error("Token renewal HTTP %s: %s", e.response.status_code, err)
+            return {"success": False, "error": f"HTTP {e.response.status_code}: {err}"}
         except Exception as e:
-            logger.error(f"Token renewal error: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error("Token renewal error: %s", type(e).__name__)
+            return {"success": False, "error": type(e).__name__}
 
     async def get_profile(self) -> Optional[dict]:
         """Get user profile and token validity."""
@@ -830,7 +830,7 @@ class DhanClient:
                 logger.error(f"Consent generation HTTP error: {e.response.status_code} - {e.response.text}")
                 return {"success": False, "error": f"HTTP {e.response.status_code}", "detail": e.response.text}
             except Exception as e:
-                logger.error(f"Consent generation error: {e}")
+                logger.error("Consent generation error: %s", type(e).__name__)
                 return {"success": False, "error": str(e)}
 
     async def generate_access_token_oauth(self, token_id: str) -> Optional[dict]:
@@ -859,7 +859,7 @@ class DhanClient:
                 logger.error(f"OAuth token generation HTTP error: {e.response.status_code} - {e.response.text}")
                 return {"success": False, "error": f"HTTP {e.response.status_code}", "detail": e.response.text}
             except Exception as e:
-                logger.error(f"OAuth token generation error: {e}")
+                logger.error("OAuth token generation error: %s", type(e).__name__)
                 return {"success": False, "error": str(e)}
 
     async def generate_access_token_with_totp(self, pin: str, totp_secret: str) -> Optional[dict]:
@@ -871,22 +871,83 @@ class DhanClient:
             
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
-                    f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={self.client_id}&pin={pin}&totp={totp_code}"
+                    "https://auth.dhan.co/app/generateAccessToken",
+                    params={"dhanClientId": self.client_id, "pin": pin, "totp": totp_code},
                 )
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    # Never log str(exception): the request URL carries the PIN as a query parameter.
+                    err = _dhan_error_text(response)
+                    logger.error("TOTP token generation HTTP %s: %s", response.status_code, err)
+                    return {"success": False, "error": f"HTTP {response.status_code}: {err}"}
                 result = response.json()
-                
-                if "accessToken" in result:
-                    new_token = result["accessToken"]
+                new_token = _extract_token(result)
+                if new_token:
                     logger.info("Successfully generated access token with TOTP")
                     return {"success": True, "new_token": new_token, "expires_in": "24h"}
-                else:
-                    logger.error(f"TOTP token generation failed: {result}")
-                    return {"success": False, "error": "No accessToken in response"}
-                    
+                logger.error("TOTP token generation failed: %s", _dhan_error_text(result))
+                return {"success": False, "error": f"no token in response ({_dhan_error_text(result)})"}
+
         except Exception as e:
-            logger.error(f"TOTP token generation error: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error("TOTP token generation error: %s", type(e).__name__)
+            return {"success": False, "error": type(e).__name__}
+
+
+def _extract_token(result) -> Optional[str]:
+    """Dhan has used accessToken / access_token / token, sometimes nested under data."""
+    if not isinstance(result, dict):
+        return None
+    for src in (result, result.get("data") if isinstance(result.get("data"), dict) else {}):
+        for key in ("accessToken", "access_token", "token"):
+            val = src.get(key)
+            if isinstance(val, str) and len(val) > 20:
+                return val
+    return None
+
+
+def _dhan_error_text(obj) -> str:
+    """Short, secret-free description of a Dhan error (response or parsed body)."""
+    import re as _re
+
+    body = obj
+    if isinstance(obj, httpx.Response):
+        try:
+            body = obj.json()
+        except ValueError:
+            body = obj.text
+    if isinstance(body, dict):
+        code = body.get("errorCode") or body.get("code") or body.get("status")
+        msg = body.get("errorMessage") or body.get("message") or body.get("remarks") or body.get("error")
+        text = " ".join(str(x) for x in (code, msg) if x) or str({k: v for k, v in body.items() if "token" not in k.lower()})
+    else:
+        text = str(body or "")
+    text = _re.sub(r"[A-Za-z0-9_\-]{30,}\.[A-Za-z0-9_\-\.]{20,}", "<token>", text)   # JWTs
+    text = _re.sub(r"(pin=)\d+", r"\1***", text, flags=_re.I)
+    return text[:200]
+
+
+async def check_token(client_id: str, access_token: str) -> dict:
+    """Ask Dhan whether a token works. {'valid': bool|None, 'reason': str, 'hours_left': float|None}."""
+    if not access_token:
+        return {"valid": False, "reason": "no token loaded", "hours_left": None}
+    try:
+        async with httpx.AsyncClient(base_url=BASE_URL, timeout=15.0) as client:
+            r = await client.get("/profile", headers={"access-token": access_token, "client-id": str(client_id or ""),
+                                                      "Accept": "application/json"})
+        if r.status_code >= 400:
+            return {"valid": False, "reason": _dhan_error_text(r), "hours_left": None}
+        validity = (r.json() or {}).get("tokenValidity", "")
+        hours = None
+        try:
+            from zoneinfo import ZoneInfo
+
+            ist = ZoneInfo("Asia/Kolkata")
+            exp = datetime.strptime(validity, "%d/%m/%Y %H:%M").replace(tzinfo=ist)
+            hours = round((exp - datetime.now(ist)).total_seconds() / 3600, 1)
+        except (TypeError, ValueError):
+            pass
+        return {"valid": True, "reason": None, "hours_left": hours}
+    except Exception as e:  # network trouble: unknown, not invalid
+        return {"valid": None, "reason": f"could not reach Dhan ({type(e).__name__})", "hours_left": None}
 
 
 async def download_scrip_master() -> pd.DataFrame:

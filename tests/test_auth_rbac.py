@@ -91,10 +91,15 @@ def test_token_status_reports_state_without_token(app_db, monkeypatch):
     monkeypatch.setenv("DHAN_ACCESS_TOKEN", "TOK-SECRET-VALUE")
     monkeypatch.setattr(tm, "_last_result", {"success": True, "action": "renewed", "method": "renew",
                                               "at": "2026-11-08T06:00:00+05:30", "message": "x"})
+    async def fake_health(*a, **k):  # offline: don't ask Dhan about a fake token
+        return {"valid": True, "reason": None, "hours_left": 20.0}
+
+    monkeypatch.setattr(tm, "token_health", fake_health)
     r = login("adm", "pw-a").get("/api/settings/token/status")
     assert r.status_code == 200
     body = r.json()
     assert body["has_token"] is True and body["last"]["method"] == "renew"
+    assert body["valid"] is True and body["hours_left"] == 20.0
     assert "TOK-SECRET-VALUE" not in r.text and "message" not in body["last"]
 
 
@@ -122,3 +127,29 @@ def test_seed_does_not_reset_existing_passwords(db):
 def test_seed_creates_users_on_empty_db(db):
     ensure_seed_users(db)
     assert db.query(T.AppUser).count() >= 1
+
+
+def test_token_status_shows_rejection_reasons_without_secrets(app_db, monkeypatch):
+    monkeypatch.setenv("DHAN_ACCESS_TOKEN", "TOK-SECRET-VALUE")
+    monkeypatch.setattr(tm, "_last_result", {"success": False, "action": "failed", "message": "free text",
+                                              "reasons": ["RenewToken → HTTP 400: DH-906 Invalid Token"]})
+
+    async def rejected(*a, **k):
+        return {"valid": False, "reason": "DH-906 Invalid Token", "hours_left": None}
+
+    monkeypatch.setattr(tm, "token_health", rejected)
+    body = login("adm", "pw-a").get("/api/settings/token/status").json()
+    assert body["valid"] is False and body["reason"] == "DH-906 Invalid Token"
+    assert body["last"]["reasons"] == ["RenewToken → HTTP 400: DH-906 Invalid Token"]
+    assert "message" not in body["last"] and "TOK-SECRET-VALUE" not in str(body)
+
+
+def test_dhan_error_text_redacts_pin_and_tokens():
+    from backend.services.dhan_client import _dhan_error_text, _extract_token
+
+    jwt = "eyJhbGciOiJIUzUxMiJ9." + "a" * 40 + "." + "b" * 40
+    assert "123456" not in _dhan_error_text("bad request for url ...?pin=123456&totp=000111")
+    assert jwt not in _dhan_error_text({"errorCode": "DH-906", "errorMessage": "Invalid Token " + jwt})
+    assert _dhan_error_text({"errorCode": "DH-906", "errorMessage": "Invalid Token"}) == "DH-906 Invalid Token"
+    assert _extract_token({"data": {"access_token": jwt}}) == jwt
+    assert _extract_token({"accessToken": jwt}) == jwt and _extract_token({"status": "error"}) is None

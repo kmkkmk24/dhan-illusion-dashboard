@@ -102,7 +102,11 @@ def cal(monkeypatch):
 
 
 @pytest.mark.parametrize("d,expected", [
-    (date(2026, 11, 9), False),    # Diwali (built-in)
+    (date(2026, 11, 9), True),     # traded (the old list wrongly had it closed)
+    (date(2026, 11, 10), False),   # Diwali Balipratipada (built-in)
+    (date(2026, 11, 8), True),     # Sunday Muhurat session
+    (date(2026, 11, 24), False),   # Guru Nanak Jayanti
+    (date(2026, 11, 30), True),    # ordinary Monday (old list wrongly had it closed)
     (date(2026, 11, 11), True),    # Wednesday
     (date(2026, 11, 14), False),   # Saturday
     (date(2027, 1, 26), False),    # from config
@@ -116,7 +120,9 @@ def test_trading_days(cal, d, expected):
     (datetime(2026, 11, 11, 10, 0, tzinfo=IST), True),
     (datetime(2026, 11, 11, 9, 14, tzinfo=IST), False),
     (datetime(2026, 11, 11, 15, 31, tzinfo=IST), False),
-    (datetime(2026, 11, 9, 10, 0, tzinfo=IST), False),
+    (datetime(2026, 11, 10, 10, 0, tzinfo=IST), False),
+    (datetime(2026, 11, 8, 10, 0, tzinfo=IST), False),    # Muhurat day, before its session
+    (datetime(2026, 11, 8, 14, 30, tzinfo=IST), True),    # inside the Muhurat session
     (datetime(2026, 11, 11, 4, 30, tzinfo=ZoneInfo("UTC")), True),  # 10:00 IST
 ])
 def test_market_open(cal, at, expected):
@@ -124,7 +130,8 @@ def test_market_open(cal, at, expected):
 
 
 def test_next_trading_day_skips_holidays_and_weekend(cal):
-    assert mc.next_trading_day(date(2026, 11, 6)) == date(2026, 11, 11)
+    assert mc.next_trading_day(date(2026, 11, 9)) == date(2026, 11, 11)   # skips the 10th
+    assert mc.next_trading_day(date(2026, 11, 6)) == date(2026, 11, 8)    # Muhurat session counts
 
 
 def test_invalid_config_holiday_ignored(monkeypatch):
@@ -135,7 +142,7 @@ def test_invalid_config_holiday_ignored(monkeypatch):
 def test_scheduler_uses_calendar(monkeypatch):
     from backend.services import scheduler
 
-    monkeypatch.setattr(mc, "today_ist", lambda: date(2026, 11, 9))
+    monkeypatch.setattr(mc, "today_ist", lambda: date(2026, 11, 10))
     assert scheduler.is_market_day() is False
     assert not hasattr(scheduler, "NSE_HOLIDAYS_2026")
 
@@ -145,3 +152,20 @@ def test_candle_timestamps_are_ist():
     assert dc._ist_naive(ts) == datetime(2026, 11, 11, 9, 15)
     midnight = int(datetime(2026, 11, 11, 0, 0, tzinfo=IST).timestamp())
     assert dc._ist_naive(midnight).date() == date(2026, 11, 11)
+
+
+
+def test_calendar_audit_flags_wrong_dates():
+    # 9 Nov traded; pretend the calendar (wrongly) still had it as a holiday, and 10 Nov missing
+    traded = {date(2026, 11, 6), date(2026, 11, 8), date(2026, 11, 9), date(2026, 11, 11)}
+    assert mc.audit_against_sessions(traded, date(2026, 11, 6), date(2026, 11, 11)) == {
+        'marked_closed_but_traded': [], 'closed_but_marked_trading': [], 'unlisted_special_sessions': []}
+    res = mc.audit_against_sessions(traded - {date(2026, 11, 9)}, date(2026, 11, 6), date(2026, 11, 11))
+    assert res['closed_but_marked_trading'] == [date(2026, 11, 9)]
+
+
+def test_config_special_sessions(monkeypatch):
+    monkeypatch.setattr('backend.config.get_config', lambda: {'market': {'special_sessions': [
+        {'date': '2027-02-01', 'open': '09:15', 'close': '15:30'}, {'date': 'bad'}]}})
+    assert mc.is_trading_day(date(2027, 2, 1)) is True            # a Monday anyway, still listed
+    assert date(2027, 2, 1) in mc.special_sessions()

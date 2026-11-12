@@ -5075,7 +5075,8 @@ function updateConnectionPill() {
     const { credentials, token } = _stConn;
     let kind = '', text = 'Checking connection…';
     if (credentials !== null && token !== null) {
-        if (token) { kind = 'ok'; text = 'Access token loaded'; }
+        if (token) { kind = 'ok'; text = 'Access token valid'; }
+        else if (_stConn.tokenReason) { kind = 'err'; text = 'Token rejected by Dhan · renew in Settings'; }
         else if (credentials) { kind = 'warn'; text = 'Credentials saved · no token yet'; }
         else { kind = 'err'; text = 'Not connected to Dhan'; }
     }
@@ -5487,10 +5488,24 @@ async function loadTokenStatus() {
     try {
         const d = await stFetchJson(`${API_BASE}/api/settings/token/status`);
         const last = d.last || {};
-        _stConn.token = !!d.has_token;
+        // Valid only when Dhan accepts it; a loaded-but-rejected token is the common failure.
+        _stConn.token = !!d.has_token && d.valid !== false;
+        _stConn.tokenReason = d.has_token && d.valid === false ? (d.reason || 'rejected by Dhan') : null;
         const methodNames = { renew: 'RenewToken', totp_ui: 'TOTP · saved', totp_env: 'TOTP · env' };
+        const tokenCell = !d.has_token ? ['Token', 'Missing', 'err']
+            : d.valid === false ? ['Token', 'Rejected by Dhan', 'err']
+            : d.valid === true ? ['Token', d.hours_left != null ? `Valid · ${d.hours_left}h left` : 'Valid', 'ok']
+            : ['Token', 'Loaded (not verified)', ''];
+        const notes = [];
+        if (d.has_token && d.valid === false) {
+            notes.push(`<strong>Dhan rejected the access token:</strong> ${stEsc(d.reason || '')}. It was revoked (a newer token was generated elsewhere) or has expired. Click <b>Renew now</b>.`);
+        }
+        if (last.action === 'failed' && (last.reasons || []).length) {
+            notes.push(`<strong>Last renewal failed:</strong><ul class="st-reasons">${last.reasons.map(r => `<li>${stEsc(r)}</li>`).join('')}</ul>`);
+        }
+        if (notes.length) stAlert('token-status', 'err', notes.join('<br>'));
         box.innerHTML = stKv([
-            ['Token', d.has_token ? 'Loaded' : 'Missing', d.has_token ? 'ok' : 'err'],
+            tokenCell,
             ['Last renewal', last.at ? stTime(last.at) : 'Not this session'],
             ['Method', methodNames[last.method] || (last.action === 'failed' ? 'Failed' : '—'), last.action === 'failed' ? 'err' : ''],
             ['Auto renewal', 'Daily 06:00 IST'],
@@ -5884,7 +5899,7 @@ function tfRenderReport() {
 
 function tfHero(d) {
     const f = d.fundamental || {}, t = d.technical || {}, c = f.company || {}, val = f.valuation || {};
-    const q = d.quote || {};
+    const pi = d.price_info || {};
     const lv = t.levels || {};
     const lo = lv.low_52w, hi = lv.high_52w, px = d.price;
     const pos = lo && hi && px && hi > lo ? Math.max(0, Math.min(100, (px - lo) / (hi - lo) * 100)) : null;
@@ -5892,7 +5907,7 @@ function tfHero(d) {
     const fundAge = meta.source === 'cache' || meta.source === 'stale-cache'
         ? `saved ${meta.age_hours != null ? (meta.age_hours < 1 ? 'under an hour' : Math.round(meta.age_hours) + 'h') : ''} ago`
         : meta.source === 'live' ? `fetched now${meta.calls_used ? ` (${meta.calls_used} Tapetide calls)` : ''}` : 'unavailable';
-    const notes = [d.sources?.price_note, meta.message].filter(Boolean);
+    const notes = [d.sources?.price_note, meta.message, ...((pi.warnings) || [])].filter(Boolean);
     return `
     <div class="tf-card tf-hero">
         <div class="tf-hero-main">
@@ -5912,8 +5927,10 @@ function tfHero(d) {
                 </div>
             </div>
             <div class="tf-hero-price">
+                <div class="tf-price-label">${pi.is_live ? '<span class="tf-live-dot"></span>Live LTP' : pi.delayed ? 'Delayed price' : pi.is_quote ? 'Last traded price' : 'Last close'}</div>
                 <div class="tf-price">${tfRs(px)}</div>
-                ${q.change_pct != null ? `<div class="${tfTone(q.change_pct)}">${tfNum(q.change, 2)} (${tfPct(q.change_pct, 2, true)})</div>` : ''}
+                ${pi.change_pct != null ? `<div class="${tfTone(pi.change_pct)}">${pi.change > 0 ? '+' : ''}${tfNum(pi.change, 2)} (${tfPct(pi.change_pct, 2, true)})</div>` : ''}
+                <div class="tf-price-meta">${tfEsc(pi.source || '')}${pi.as_of ? ` · ${tfEsc(String(pi.as_of).replace('T', ' '))}` : ''}${pi.prev_close ? `<br>Prev close ${tfRs(pi.prev_close)}${pi.prev_close_date ? ` (${tfEsc(pi.prev_close_date)})` : ''}` : ''}</div>
             </div>
         </div>
         <div class="tf-hero-stats">

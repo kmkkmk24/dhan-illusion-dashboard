@@ -43,6 +43,7 @@ def _apply_token(token: str, method: str) -> None:
 
     os.environ[ENV_KEY] = token
     settings_manager.save_access_token(token, datetime.now(IST).isoformat())
+    invalidate_health_cache()
     logger.info("Dhan access token updated via %s", method)
 
 
@@ -83,10 +84,12 @@ async def _generate(client) -> dict:
     """Try RenewToken, then TOTP with UI credentials, then TOTP with env vars."""
     from backend.services.settings_manager import settings_manager
 
+    reasons: list[str] = []
     if client.access_token:
         res = await client.renew_token()
         if res and res.get("success") and res.get("new_token"):
             return {"success": True, "method": "renew", "token": res["new_token"]}
+        reasons.append(f"RenewToken → {(res or {}).get('error') or 'failed'}")
         logger.warning("RenewToken failed; trying TOTP")
 
     creds = settings_manager.load_credentials()
@@ -94,18 +97,23 @@ async def _generate(client) -> dict:
         res = await client.generate_access_token_with_totp(creds["pin"], creds["totp_secret"])
         if res and res.get("success") and res.get("new_token"):
             return {"success": True, "method": "totp_ui", "token": res["new_token"]}
+        reasons.append(f"PIN + TOTP (saved) → {(res or {}).get('error') or 'failed'}")
         logger.warning("TOTP with UI credentials failed")
+    else:
+        reasons.append("PIN + TOTP → not saved in Settings")
 
     pin, secret = os.environ.get("DHAN_PIN"), os.environ.get("DHAN_TOTP_SECRET")
     if pin and secret:
         res = await client.generate_access_token_with_totp(pin, secret)
         if res and res.get("success") and res.get("new_token"):
             return {"success": True, "method": "totp_env", "token": res["new_token"]}
+        reasons.append(f"PIN + TOTP (env) → {(res or {}).get('error') or 'failed'}")
 
     return {
         "success": False,
-        "message": "Token renewal failed. Save PIN + TOTP secret in Settings, "
-        "or generate a token at https://web.dhan.co/ and set DHAN_ACCESS_TOKEN.",
+        "reasons": reasons,
+        "message": "Token renewal failed. " + " · ".join(reasons)
+        + ". If this persists, generate a token at https://web.dhan.co/ (Profile → DhanHQ Trading APIs).",
     }
 
 
@@ -145,7 +153,7 @@ async def renew_token(*, force: bool = False) -> dict:
             else:
                 logger.warning("❌ %s", res.get("message"))
                 _last_result = {"success": False, "action": "failed", "message": res.get("message"),
-                                "at": datetime.now(IST).isoformat()}
+                                "reasons": res.get("reasons") or [], "at": datetime.now(IST).isoformat()}
             return dict(_last_result)
         except Exception as e:
             logger.error("Token renewal error: %s", e, exc_info=True)
@@ -162,3 +170,25 @@ async def ensure_valid_token() -> dict:
 
 def last_result() -> dict:
     return dict(_last_result)
+
+
+_check_cache: dict = {"at": 0.0, "token": None, "result": None}
+
+
+async def token_health(max_age_sec: float = 60.0) -> dict:
+    """Is the loaded token accepted by Dhan right now? Cached briefly so the Settings page stays cheap."""
+    from backend.services.dhan_client import check_token
+    from backend.services.settings_manager import settings_manager
+
+    tok = current_token()
+    now = time.monotonic()
+    if _check_cache["result"] is not None and _check_cache["token"] == tok and now - _check_cache["at"] < max_age_sec:
+        return dict(_check_cache["result"])
+    creds = settings_manager.load_credentials() or {}
+    res = await check_token(str(creds.get("client_id") or os.environ.get("DHAN_CLIENT_ID") or ""), tok)
+    _check_cache.update({"at": now, "token": tok, "result": res})
+    return dict(res)
+
+
+def invalidate_health_cache() -> None:
+    _check_cache["result"] = None

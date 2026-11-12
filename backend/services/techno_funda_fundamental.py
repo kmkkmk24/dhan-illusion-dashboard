@@ -106,7 +106,7 @@ def _fmt(v: Optional[float], suffix: str = "", nd: int = 1) -> str:
 # ───────────────────────── main ─────────────────────────
 
 def analyze_fundamentals(raw: dict[str, Any], *, valuation_helper=None, gsec_yield: float = 6.5,
-                         prices=None) -> dict:
+                         prices=None, live_price: Optional[float] = None) -> dict:
     """
     raw keys (any may be None): profile, quarterly, profit_loss, balance_sheet, cash_flow, ratios,
     shareholding, forecasts, pledge, score, deals, concall, news, corporate_actions, credit, options.
@@ -136,6 +136,15 @@ def analyze_fundamentals(raw: dict[str, Any], *, valuation_helper=None, gsec_yie
     bvps = _num(pm.get("book_value")) or _num(fnd.get("book_value"))
     mcap = _num(fnd.get("market_cap"))
     div_yield = _num(fnd.get("dividend_yield"))
+    price_basis = "screener"
+    if live_price and price and live_price > 0:
+        # Screener/Tapetide ratios are computed at their own (delayed) price; rescale to the live price.
+        f = live_price / price
+        pe = pe * f if pe else pe
+        pb = pb * f if pb else pb
+        mcap = mcap * f if mcap else mcap
+        div_yield = div_yield / f if div_yield else div_yield
+        price, price_basis = live_price, "live"
 
     pl, bs, cf, rt, q = (raw.get(k) for k in ("profit_loss", "balance_sheet", "cash_flow", "ratios", "quarterly"))
 
@@ -366,7 +375,7 @@ def analyze_fundamentals(raw: dict[str, Any], *, valuation_helper=None, gsec_yie
     if pe is not None and pe <= 0:
         vc.append(_check("Company is profitable (positive PE)", "fail", "Loss-making on a TTM basis"))
 
-    valuation = {"price": price, "pe": pe, "pb": pb, "eps_ttm": eps, "book_value": bvps, "market_cap_cr": mcap,
+    valuation = {"price": price, "price_basis": price_basis, "pe": _r(pe), "pb": _r(pb),"eps_ttm": eps, "book_value": bvps, "market_cap_cr": mcap,
                  "dividend_yield": div_yield, "median_pe_hist": median_pe, "median_pe_basis": median_pe_basis,
                  "forward_eps": _r(fwd_eps),
                  "forward_pe": fwd_pe, "forward_period": fc_latest.get("eps_estimate_period"),

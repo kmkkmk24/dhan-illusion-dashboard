@@ -5277,6 +5277,14 @@ let _swView = (() => { try { return localStorage.getItem(SW_VIEW_KEY) || 'picks'
 let _swOverview = null;
 let _swPoll = 0;
 const _swFilter = { status: 'actionable', tier: 'B' };
+const SW_LAYOUT_KEY = 'swing-list-layout';
+let _swLayout = (() => { try { return localStorage.getItem(SW_LAYOUT_KEY) || 'cards'; } catch (_) { return 'cards'; } })();
+
+function swSetLayout(v, type) {
+    _swLayout = v;
+    try { localStorage.setItem(SW_LAYOUT_KEY, v); } catch (_) { /* private mode */ }
+    swRenderList(type);
+}
 const SW_STATUS = {
     triggered: ['Breakout today', 'Closed above the entry today. Buy only if within 4% of the entry and volume confirms.'],
     ready: ['Ready', 'Within a few % of the entry. Place a buy-stop (GTT) at the entry price.'],
@@ -5447,7 +5455,8 @@ function swRenderPicks() {
     const picks = o.top_picks || [];
     const s = o.last_run?.setups || {};
     body.innerHTML = `${unprot}${swRegimeBanner(o.regime)}
-        <div class="sw-section-head"><h3>Top picks <span class="sw-muted">(${picks.length} of max ${o.settings?.top_picks})</span></h3>
+        <div class="sw-section-head"><h3>Top picks <button type="button" class="sw-i" onclick="swTopPicksInfo()" aria-label="How Top picks are chosen" title="How Top picks are chosen">i</button>
+            <span class="sw-muted">(${picks.length} of max ${o.settings?.top_picks})</span></h3>
             <span class="sw-muted">Scanned ${o.last_run?.scanned ?? '—'} liquid stocks · ${s.VCP || 0} VCP · ${s.FLAG || 0} flags · ${s.IPO || 0} IPO bases ·
             ranked by quality, max ${o.settings?.max_per_sector} per sector, no results-week names</span></div>
         ${picks.length ? `<div class="sw-cards">${picks.map(swCard).join('')}</div>`
@@ -5457,9 +5466,53 @@ function swRenderPicks() {
             Accuracy of every suggestion is tracked automatically on the Scorecard.</p>`;
 }
 
-function swStatusPill(st) {
-    const [label, help] = SW_STATUS[st] || [st, ''];
+function swTopPicksInfo() {
+    const o = _swOverview || {};
+    const st = o.settings || {};
+    const reg = o.regime?.label || 'uptrend';
+    const grades = { uptrend: 'A+ (80+) and A (70+)', caution: 'A+ (80+) only', downtrend: 'none: no new entries in a downtrend' }[reg];
+    const row = (n, title, text) => `<li><b>${n}. ${title}</b><span>${text}</span></li>`;
+    swDialog(`<h3 id="sw-dialog-title">How Top picks are chosen</h3>
+        <p class="sw-muted">Every VCP, Flag and IPO setup found in the scan must pass ALL of these. Top picks are the setups the system would actually act on today;
+            everything else stays visible in the VCP / Flag / IPO tabs.</p>
+        <ol class="sw-rules">
+            ${row(1, 'Actionable today', '<b>Ready</b> (within ~3% below the entry) or <b>Breakout today</b> (closed above the entry, but not more than 4%). Forming and Extended setups never qualify.')}
+            ${row(2, 'Quality grade, set by the market', `Today the market is <b>${swEsc(reg.toUpperCase())}</b>, so the allowed grades are <b>${grades}</b>. In CAUTION only A+ qualifies; in a DOWNTREND the list stays empty on purpose.`)}
+            ${row(3, 'A sensible stop', 'Setups whose stop is more than 8% away (9% for IPO bases) are marked “wide” and excluded: the risk cannot be kept small.')}
+            ${row(4, 'A market leader', `RS rating of at least 60: the stock has outperformed at least 60% of the ${o.last_run?.scanned ? o.last_run.scanned.toLocaleString('en-IN') + '-stock' : 'liquid-stock'} universe over the last 12 months.`)}
+            ${row(5, 'No results soon', `No results or board meeting within <b>${st.earnings_block_days ?? 7} days</b>, so an earnings gap cannot jump past the stop.`)}
+            ${row(6, 'Diversified', `At most <b>${st.max_per_sector ?? 2} per sector</b>, so one bad sector day cannot hit every position.`)}
+            ${row(7, 'Short list', `Ranked by score and cut at <b>${st.top_picks ?? 8}</b>. There are fewer when not enough qualify; the list is never padded.`)}
+        </ol>
+        <h4>The score (0–100)</h4>
+        <table class="sw-table sw-score-table"><tbody>
+            <tr><td>Pattern quality</td><td class="r">35</td><td class="sw-muted">${swEsc(SW_COMP_HELP.pattern)}</td></tr>
+            <tr><td>Trend</td><td class="r">15</td><td class="sw-muted">${swEsc(SW_COMP_HELP.trend)}</td></tr>
+            <tr><td>Relative strength</td><td class="r">15</td><td class="sw-muted">${swEsc(SW_COMP_HELP.rs)}</td></tr>
+            <tr><td>Sector</td><td class="r">15</td><td class="sw-muted">${swEsc(SW_COMP_HELP.sector)}</td></tr>
+            <tr><td>Smart money</td><td class="r">12</td><td class="sw-muted">${swEsc(SW_COMP_HELP.smart_money)}</td></tr>
+            <tr><td>Risk / room</td><td class="r">8</td><td class="sw-muted">${swEsc(SW_COMP_HELP.risk)}</td></tr>
+        </tbody></table>
+        <p class="sw-muted">Grades: A+ 80+, A 70+, B 60+, C below. Picks-per-sector, number of picks and the results window can be changed under <b>Risk settings</b>.</p>`);
+}
+
+function swStatusPill(st, r) {
+    let [label, help] = SW_STATUS[st] || [st, ''];
+    if (st === 'triggered' && r?.breakout_age > 0) {
+        label = `Breakout · day ${r.breakout_age + 1}`;
+        help = `Broke out on ${r.broke_out_on}; still within 4% of the entry, so still buyable on the original plan.`;
+    }
     return `<span class="sw-pill sw-st--${swEsc(st)}" title="${swEsc(help)}">${swEsc(label)}</span>`;
+}
+
+function swLifecycleNote(r) {
+    const notes = [];
+    if (r.carried) notes.push(r.broke_out_on
+        ? `Broke out on ${swEsc(r.broke_out_on)}: tracked on the original plan until it extends, fails or hits the stop.`
+        : 'Not re-detected in the latest scan (one-candle change); kept on its plan for up to 2 sessions.');
+    const f = r.fresh_levels;
+    if (f) notes.push(`Plan kept for consistency. Latest pattern levels: entry ${swRs(f.entry)}, stop ${swRs(f.stop)}.`);
+    return notes.length ? `<div class="sw-life">${notes.map(n => `<span>${n}</span>`).join('')}</div>` : '';
 }
 
 function swTierPill(r) {
@@ -5495,7 +5548,33 @@ function swPlanGrid(r) {
         <div><span>T2</span><b class="sw-pos">${swRs(r.target2)}</b><small>${r.rr ? r.rr + 'R' : ''}</small></div>
         <div><span>Qty</span><b>${sz.qty ?? '—'}</b><small>${swInr(sz.position_value)}${sz.pct_of_capital != null ? ` · ${sz.pct_of_capital}%` : ''}</small></div>
         <div><span>Risk</span><b>${swInr(sz.risk_amount)}</b><small>if stopped</small></div>
-    </div>`;
+    </div>${swExample(r.example)}${swTiming(r.timing)}`;
+}
+
+const SW_TIMING_HELP = 'Estimated holding time, from 2,000 simulated paths built out of this stock’s own last year of daily moves '
+    + '(5-day blocks, past drift halved so strong stocks are not over-promised). Days are trading sessions after the entry fills; '
+    + 'the range is the middle half of outcomes. The chance is a statistical baseline that gives the pattern no edge: '
+    + 'the Scorecard shows how often setups actually beat it.';
+
+function swTiming(t) {
+    if (!t || !t.t1) return `<div class="sw-timing" title="${swEsc(SW_TIMING_HELP)}"><b>⏱ Est. holding time:</b>
+        <span class="sw-muted">not enough trading history yet for a reliable estimate (needs ~60 sessions)</span></div>`;
+    const est = (label, x) => x && x.median != null
+        ? `<span>${label} <b>~${x.median} days</b> <small>(${x.p25}–${x.p75})</small></span>`
+        : `<span>${label} <small>not reached within ${t.horizon} days in most paths</small></span>`;
+    return `<div class="sw-timing" title="${swEsc(SW_TIMING_HELP)}">
+        <b>⏱ Est. holding time:</b> ${est('T1', t.t1)}${est('T2', t.t2)}
+        <span class="sw-muted">baseline chance T1 before stop ${Math.round(t.t1.prob)}%</span></div>`;
+}
+
+function swExample(x) {
+    if (!x) return '';
+    const cap = swInr(x.capital);
+    if (!x.qty) return `<div class="sw-example"><b>Example with ${cap}:</b> one share costs more than that.</div>`;
+    const part = (label, v, cls) => v ? `<span>${label} <b class="${cls}">${v.amount >= 0 ? '+' : '−'}${swInr(Math.abs(v.amount))}</b> <small>(${v.pct >= 0 ? '+' : ''}${v.pct.toFixed(1)}%)</small></span>` : '';
+    return `<div class="sw-example" title="Illustration only: ${x.qty} shares bought at the entry with ${cap}. Your actual quantity comes from the risk settings (Qty above).">
+        <b>Example with ${cap}:</b> ${x.qty} shares (${swInr(x.invested)})
+        ${part('→ T1', x.t1, 'sw-pos')}${part('T2', x.t2, 'sw-pos')}${part('Stop', x.stop, 'sw-neg')}</div>`;
 }
 
 function swCard(r) {
@@ -5506,16 +5585,18 @@ function swCard(r) {
         <header>
             <div>${swSymbol(r)} ${swSetupBadge(r.setup)} ${r.is_fno ? '<span class="sw-tag">F&amp;O</span>' : ''}
                 <div class="sw-name">${swEsc(r.name || '')}${r.sector ? ` · ${swEsc(r.sector)}${r.sector_rank ? ` #${r.sector_rank}` : ''}` : ''}</div></div>
-            <div class="sw-card-tags">${swTierPill(r)} ${swStatusPill(r.status)}</div>
+            <div class="sw-card-tags">${r.top_pick && _swView !== 'picks' ? '<span class="sw-tag sw-tag--pick" title="Also in Top picks">★ Top pick</span>' : ''}${swTierPill(r)} ${swStatusPill(r.status, r)}</div>
         </header>
         <div class="sw-card-price"><b>${swRs(r.close)}</b> <span class="sw-muted">${r.distance_pct != null ? (r.distance_pct > 0 ? `${r.distance_pct.toFixed(1)}% below entry` : `${(-r.distance_pct).toFixed(1)}% above entry`) : ''} · RS ${r.rs_rating ?? '—'}</span></div>
         ${r.chart ? swChart(r.chart, r, 600, 170) : ''}
         ${swPlanGrid(r)}
+        ${swLifecycleNote(r)}
         <ul class="sw-why">${reasons.map(x => `<li>${swEsc(x)}</li>`).join('')}</ul>
         ${warns.length ? `<ul class="sw-warn">${warns.map(x => `<li>${swEsc(x)}</li>`).join('')}</ul>` : ''}
         ${swComponents(r.components)}
         <footer onclick="event.stopPropagation()">${swTradeButtons(r)}
-            <button type="button" class="tf-btn sw-ghost" onclick="swDismiss(${r.id})" title="Hide this setup">Dismiss</button></footer>
+            <span class="sw-card-tools">${isAdminUser() ? `<button type="button" class="tf-btn" onclick="swNotify(${r.id}, this)" title="Send this card as an image to Telegram">Notify</button>` : ''}
+            <button type="button" class="tf-btn sw-icon-btn" onclick="swDismiss(${r.id})" title="Dismiss: hide this setup" aria-label="Dismiss ${swEsc(r.symbol)}">✕</button></span></footer>
     </article>`;
 }
 
@@ -5530,28 +5611,60 @@ function swTradeButtons(r) {
 // ── mini candlestick chart with plan levels ──
 function swChart(rows, r, W = 600, H = 170) {
     if (!rows?.length) return '';
-    const volH = 26, top = 6, priceH = H - volH - top - 4;
-    const lo = Math.min(...rows.map(x => x[3]), r.stop ?? Infinity) * 0.995;
-    const hi = Math.max(...rows.map(x => x[2]), r.target1 ?? -Infinity) * 1.005;
+    // Shapes live in a stretchable SVG (left 76%); every label is a crisp HTML tag in the right-hand strip,
+    // so nothing is distorted and no tag sits on top of the candles.
+    // Candles fill the left cell; the tags get their own right-hand column (sized to the longest tag),
+    // so a tag can never cover the latest candles, whatever the card width.
+    const plotW = W, volH = H * 0.15, top = 8, priceH = H - volH - top - 6;
+    const highs = rows.map(x => x[2]), lows = rows.map(x => x[3]);
+    const maxH = Math.max(...highs);
+    const t2Off = r.target2 != null && r.target2 > Math.max(maxH, r.target1 ?? 0) * 1.15;   // too far: tag at the top edge
+    const lo = Math.min(...lows, r.stop ?? Infinity) * 0.99;
+    const hi = Math.max(maxH, r.target1 ?? -Infinity, t2Off ? -Infinity : (r.target2 ?? -Infinity)) * 1.01;
     const y = v => top + (hi - v) / (hi - lo) * priceH;
-    const n = rows.length, bw = W / n;
-    const vmax = Math.max(...rows.map(x => x[5])) || 1;
-    let candles = '', vols = '';
+    const n = rows.length, bw = plotW / n;
+    const vmax = (() => { const v = rows.map(x => x[5]).sort((a, b) => a - b); return (v[Math.floor(v.length * 0.95)] || 1) * 1.5; })();
+    let shapes = '';
     rows.forEach((x, i) => {
         const [, o, h, l, c, v] = x;
-        const cx = i * bw + bw / 2, up = c >= o;
-        const cls = up ? 'sw-c-up' : 'sw-c-dn';
-        candles += `<line x1="${cx.toFixed(1)}" x2="${cx.toFixed(1)}" y1="${y(h).toFixed(1)}" y2="${y(l).toFixed(1)}" class="${cls}"/>`;
+        const cx = i * bw + bw / 2, cls = c >= o ? 'sw-c-up' : 'sw-c-dn';
+        shapes += `<line x1="${cx.toFixed(1)}" x2="${cx.toFixed(1)}" y1="${y(h).toFixed(1)}" y2="${y(l).toFixed(1)}" class="${cls}"/>`;
         const yb = y(Math.max(o, c)), hb = Math.max(1, Math.abs(y(o) - y(c)));
-        candles += `<rect x="${(cx - bw * 0.35).toFixed(1)}" y="${yb.toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${hb.toFixed(1)}" class="${cls}"/>`;
-        const vh = v / vmax * volH;
-        vols += `<rect x="${(cx - bw * 0.35).toFixed(1)}" y="${(H - vh).toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${vh.toFixed(1)}" class="sw-vol"/>`;
+        shapes += `<rect x="${(cx - bw * 0.35).toFixed(1)}" y="${yb.toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${hb.toFixed(1)}" class="${cls}"/>`;
+        const vh = Math.min(v, vmax) / vmax * volH;
+        shapes += `<rect x="${(cx - bw * 0.35).toFixed(1)}" y="${(H - vh).toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${vh.toFixed(1)}" class="sw-vol"/>`;
     });
-    const line = (v, cls, label) => v == null || v > hi || v < lo ? '' :
-        `<line x1="0" x2="${W}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}" class="${cls}"/><text x="${W - 4}" y="${(y(v) - 3).toFixed(1)}" class="sw-lbl ${cls}" text-anchor="end">${label} ${swRs(v)}</text>`;
-    return `<svg class="sw-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Last ${n} days with entry, stop and targets">
-        ${vols}${candles}${line(r.target2, 'sw-l-t2', 'T2')}${line(r.target1, 'sw-l-t1', 'T1')}${line(r.entry, 'sw-l-entry', 'Entry')}${line(r.stop, 'sw-l-stop', 'Stop')}
-    </svg>`;
+    const ex = r.example || {};
+    const money = v => v ? `${v.amount >= 0 ? '+' : '−'}${swInr(Math.abs(v.amount))}` : '';
+    const levels = [
+        { v: r.target2, k: 't2', name: 'T2', sub: money(ex.t2), off: t2Off },
+        { v: r.target1, k: 't1', name: 'T1', sub: money(ex.t1) },
+        { v: r.entry, k: 'entry', name: 'Entry', sub: ex.qty ? `${ex.qty} sh` : '' },
+        { v: r.stop, k: 'stop', name: 'Stop', sub: money(ex.stop) },
+    ].filter(L => L.v != null && (L.off || (L.v <= hi && L.v >= lo)));
+    levels.forEach(L => {
+        L.y = L.off ? top : y(L.v);
+        if (!L.off) shapes += `<line x1="0" x2="${plotW}" y1="${L.y.toFixed(1)}" y2="${L.y.toFixed(1)}" class="sw-l-${L.k}"/>`;
+        L.pct = L.y / H * 100;
+    });
+    // keep tags from overlapping: minimum vertical gap, pushed downwards in price order
+    const tagPx = H >= 250 ? 28 : 22;                       // two-line tag height
+    const half = tagPx / 2 / H * 100 + 1, gap = tagPx / H * 100 + 1;
+    levels.sort((a, b) => a.pct - b.pct);
+    if (levels.length) levels[0].pct = Math.max(levels[0].pct, half);
+    for (let i = 1; i < levels.length; i++) levels[i].pct = Math.max(levels[i].pct, levels[i - 1].pct + gap);
+    const over = levels.length ? levels[levels.length - 1].pct - (100 - half) : 0;
+    if (over > 0) levels.forEach(L => { L.pct = Math.max(half, L.pct - over); });
+    const head = L => `${L.off ? '↑' : ''}${L.name} ${swRs(L.v)}`;
+    const tags = levels.map(L => `<span class="sw-lvl sw-lvl--${L.k}" style="top:${L.pct.toFixed(1)}%">
+        <b>${head(L)}</b>${L.sub ? `<em>${L.sub}</em>` : ''}</span>`).join('');
+    const longest = Math.max(0, ...levels.map(L => Math.max(head(L).length, (L.sub || '').length)));
+    const colPx = Math.ceil(longest * (H >= 250 ? 6.4 : 5.3) + 10);
+    const capNote = ex.qty ? `<span class="sw-chart-note">P&amp;L on ${swInr(ex.capital)}</span>` : '';
+    return `<div class="sw-chart-wrap" style="--h:${H}px; --tagw:${colPx}px">
+        <div class="sw-chart-plot"><svg class="sw-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+            aria-label="Last ${n} days with entry ${swRs(r.entry)}, stop ${swRs(r.stop)}, targets ${swRs(r.target1)} and ${swRs(r.target2)}">${shapes}</svg>${capNote}</div>
+        <div class="sw-chart-tags">${tags}</div></div>`;
 }
 
 // ── per-setup lists ──
@@ -5561,7 +5674,7 @@ async function swRenderList(type) {
     const statusMap = { actionable: 'triggered,ready', forming: 'forming', extended: 'extended', all: '' };
     let rows;
     try {
-        const qs = new URLSearchParams({ setup: type, min_tier: _swFilter.tier });
+        const qs = new URLSearchParams({ setup: type, min_tier: _swFilter.tier, full: _swLayout === 'cards' ? 'true' : 'false' });
         if (statusMap[_swFilter.status]) qs.set('status', statusMap[_swFilter.status]);
         rows = await swJson(`/api/swing/setups?${qs}`);
     } catch (e) {
@@ -5579,8 +5692,13 @@ async function swRenderList(type) {
             <div>${chip('status', 'actionable', 'Actionable')}${chip('status', 'forming', 'Forming')}${chip('status', 'extended', 'Extended')}${chip('status', 'all', 'All')}</div>
             <div>${chip('tier', 'A', 'A+ / A')}${chip('tier', 'B', 'B and better')}${chip('tier', 'C', 'All grades')}</div>
             <span class="sw-muted">${rows.length} setup${rows.length === 1 ? '' : 's'}</span>
+            <div class="sw-layout" role="group" aria-label="Layout">
+                <button type="button" class="sw-fchip ${_swLayout === 'cards' ? 'active' : ''}" onclick="swSetLayout('cards', '${type}')">Cards</button>
+                <button type="button" class="sw-fchip ${_swLayout === 'table' ? 'active' : ''}" onclick="swSetLayout('table', '${type}')">Table</button>
+            </div>
         </div>
-        ${rows.length ? `<div class="sw-table-wrap"><table class="sw-table">
+        ${rows.length && _swLayout === 'cards' ? `<div class="sw-cards">${rows.map(swCard).join('')}</div>`
+        : rows.length ? `<div class="sw-table-wrap"><table class="sw-table">
             <thead><tr><th>Stock</th><th>Grade</th><th>Status</th><th class="r">Close</th><th class="r">Entry</th><th class="r">Gap</th>
                 <th class="r">Stop</th><th class="r">T1 / T2</th><th class="r">Qty</th><th class="r">RS</th><th>Sector</th><th>Pattern</th><th></th></tr></thead>
             <tbody>${rows.map(swRow).join('')}</tbody></table></div>`
@@ -5598,7 +5716,7 @@ function swRow(r) {
     const warn = (r.warnings || []).length;
     return `<tr class="${r.top_pick ? 'sw-row-pick' : ''}" onclick="swDetail(${r.id})">
         <td>${swSymbol(r)}${r.top_pick ? ' <span class="sw-star" title="Top pick">★</span>' : ''}</td>
-        <td>${swTierPill(r)}</td><td>${swStatusPill(r.status)}</td>
+        <td>${swTierPill(r)}</td><td>${swStatusPill(r.status, r)}</td>
         <td class="r">${swRs(r.close)}</td><td class="r"><b>${swRs(r.entry)}</b></td>
         <td class="r">${r.distance_pct != null ? swPct(r.distance_pct) : '—'}</td>
         <td class="r sw-neg">${swRs(r.stop)} <small>−${(r.risk_pct ?? 0).toFixed(1)}%</small></td>
@@ -5623,9 +5741,9 @@ async function swDetail(id) {
         ['Results / board meeting', r.event ? `${r.event.date} (${r.event.days}d)` : 'None in 3 weeks'],
         ['NSE surveillance', r.surveillance ? r.surveillance.desc : 'None'],
     ];
-    swDialog(`<h3 id="sw-dialog-title">${swSymbol(r)} ${swSetupBadge(r.setup)} ${swTierPill(r)} ${swStatusPill(r.status)}</h3>
+    swDialog(`<h3 id="sw-dialog-title">${swSymbol(r)} ${swSetupBadge(r.setup)} ${swTierPill(r)} ${swStatusPill(r.status, r)}</h3>
         <p class="sw-muted">${swEsc(r.name || '')} · ${swEsc(r.sector || 'sector n/a')} · close ${swRs(r.close)} · first seen ${r.first_seen}</p>
-        ${swChart(r.chart, r, 760, 230)}
+        ${swChart(r.chart, r, 760, 300)}
         ${swPlanGrid(r)}
         <div class="sw-detail-grid">
             <div><h4>Why it qualifies</h4><ul class="sw-why">${(r.reasons || []).map(x => `<li>${swEsc(x)}</li>`).join('')}</ul>
@@ -5633,7 +5751,9 @@ async function swDetail(id) {
             <div><h4>Score breakdown</h4>${swComponents(r.components)}
                 <h4>Facts</h4><dl class="sw-facts">${facts.map(([k, v]) => `<dt>${swEsc(k)}</dt><dd>${swEsc(v ?? '—')}</dd>`).join('')}</dl></div>
         </div>
-        <footer class="sw-dialog-foot">${swTradeButtons(r)}</footer>`);
+        <footer class="sw-dialog-foot">${swTradeButtons(r)}
+            ${isAdminUser() ? `<button type="button" class="tf-btn" onclick="swNotify(${r.id}, this)">Notify on Telegram</button>` : ''}
+            <a class="tf-btn" href="/api/swing/setups/${r.id}/card.png" target="_blank" rel="noopener">Card image</a></footer>`);
 }
 
 function swDialog(html) {
@@ -5645,6 +5765,21 @@ function swDialog(html) {
 function swCloseDialog() {
     const d = document.getElementById('sw-dialog');
     if (d.open) d.close();
+}
+
+async function swNotify(id, btn) {
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+    try {
+        await swJson(`/api/swing/setups/${id}/notify`, { method: 'POST' });
+        btn.textContent = 'Sent ✓';
+    } catch (e) {
+        btn.textContent = label;
+        alert(e.message);
+    } finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 2500);
+    }
 }
 
 async function swDismiss(id) {
@@ -5674,7 +5809,10 @@ async function swTradeDialog(id, mode) {
             <label>Target (T2) ₹<input name="target" type="number" step="0.05" value="${r.target2}" required oninput="swTicketCalc()"></label>
             <label>T1 (book half) ₹<input name="t1" type="number" step="0.05" value="${r.target1}"></label>
             ${mode === 'limit' ? `<label>Limit price ₹<input name="limit_price" type="number" step="0.05" value="${r.close}"></label>` : ''}
-            ${mode === 'paper' ? `<label>Already bought at ₹ <small>(optional)</small><input name="fill_price" type="number" step="0.05" placeholder="leave empty to wait for entry"></label>` : ''}
+            ${mode === 'paper' ? `<fieldset class="sw-otype"><legend>Paper entry type</legend>
+                <label class="sw-check"><input type="radio" name="paper_order" value="stop" ${r.status !== 'triggered' ? 'checked' : ''}> Buy-stop — buy when the price <b>rises to</b> the entry (breakout confirmation)</label>
+                <label class="sw-check"><input type="radio" name="paper_order" value="limit" ${r.status === 'triggered' ? 'checked' : ''}> Limit — buy when the price is <b>at or below</b> the entry</label></fieldset>
+                <label>Already bought at ₹ <small>(optional)</small><input name="fill_price" type="number" step="0.05" placeholder="leave empty to wait for entry"></label>` : ''}
             <div id="sw-ticket-calc" class="sw-ticket-calc"></div>
             ${live ? `<label class="sw-check"><input type="checkbox" name="confirm" required> I understand this sends a REAL order to Dhan with my money.</label>` : ''}
             ${r.regime === 'downtrend' && live ? `<label class="sw-check"><input type="checkbox" name="override_regime"> The market is in a DOWNTREND; enter anyway.</label>` : ''}
@@ -5706,6 +5844,8 @@ async function swSubmitTrade(setupId, mode) {
     const body = { setup_id: setupId, mode, qty: +val('qty'), entry: +val('entry'), stop: +val('stop'), target: +val('target'), t1: +val('t1') };
     if (val('limit_price')) body.limit_price = +val('limit_price');
     if (val('fill_price')) body.fill_price = +val('fill_price');
+    const ot = f.querySelector('input[name=paper_order]:checked');
+    if (ot) body.paper_order = ot.value;
     if (f.elements.override_regime?.checked) body.override_regime = true;
     const btn = f.querySelector('button[type=submit]');
     btn.disabled = true;
@@ -5745,11 +5885,19 @@ async function swRenderTrades() {
         body.innerHTML = `<div class="sw-empty">${swEsc(e.message)}</div>`;
         return;
     }
+    _swTradesCache = open;
+    clearTimeout(swRenderTrades._t);
+    swRenderTrades._t = setTimeout(() => {
+        if (_swView === 'trades' && !document.getElementById('content-swing').classList.contains('hidden')
+            && !document.getElementById('sw-dialog').open) swRenderTrades();
+    }, 60000);
     const unreal = open.reduce((a, t) => a + (t.unrealized || 0), 0);
     const realized = closed.reduce((a, t) => a + (t.pnl || 0), 0);
     body.innerHTML = `<div class="sw-section-head"><h3>Open &amp; pending (${open.length})</h3>
             <span>Unrealised <b class="${unreal >= 0 ? 'sw-pos' : 'sw-neg'}">${swInr(unreal)}</b>
             ${isAdminUser() ? '<button type="button" class="tf-btn" onclick="swSync()">Sync with Dhan</button>' : ''}</span></div>
+        <p class="sw-foot">Entries, stops and targets are checked every 2 minutes during market hours (9:15–3:30) using Dhan’s live price and the day’s high/low,
+            so a move between two checks still counts; after the close the official daily candle is used as a backstop. This page refreshes every minute.</p>
         ${open.length ? `<div class="sw-trades">${open.map(swTradeCard).join('')}</div>` : '<div class="sw-empty">No open swing trades. Take one from Top picks.</div>'}
         <div class="sw-section-head"><h3>Closed (${closed.length})</h3><span>Realised <b class="${realized >= 0 ? 'sw-pos' : 'sw-neg'}">${swInr(realized)}</b></span></div>
         ${closed.length ? `<div class="sw-table-wrap"><table class="sw-table"><thead><tr><th>Stock</th><th>Setup</th><th>Mode</th><th>Entry</th><th>Exit</th>
@@ -5778,7 +5926,7 @@ function swTradeCard(t) {
     };
     return `<article class="sw-trade ${acts.some(a => a.severity === 'high') ? 'sw-trade--alert' : ''}">
         <header><div><b class="sw-trade-sym">${swEsc(t.symbol)}</b> ${t.setup ? swSetupBadge(t.setup) : ''} ${prot}
-            <div class="sw-muted">${t.status === 'pending' ? 'waiting for entry' : `since ${swEsc(t.entry_date || '—')}`} · qty ${t.qty}</div></div>
+            <div class="sw-muted">${t.status === 'pending' ? swPendingText(t) : `since ${swEsc(t.entry_date || '—')}`} · qty ${t.qty}</div></div>
             <div class="sw-trade-pl"><b class="${(t.unrealized ?? 0) >= 0 ? 'sw-pos' : 'sw-neg'}">${t.unrealized != null ? swInr(t.unrealized) : '—'}</b>
             <span>${swR(t.r_now)} · LTP ${swRs(t.ltp)}</span></div></header>
         <div class="sw-plan sw-plan--sm">
@@ -5790,9 +5938,72 @@ function swTradeCard(t) {
         ${t.protection_note && t.mode !== 'paper' ? `<div class="sw-note">${swEsc(t.protection_note)}</div>` : ''}
         ${acts.length ? `<ul class="sw-advice">${acts.map(a => `<li class="sw-sev--${a.severity}">${swEsc(a.reason)} ${actBtn(a)}</li>`).join('')}</ul>`
             : (t.status === 'open' ? '<div class="sw-muted sw-hold">Hold: no action needed (advice refreshes after the close).</div>' : '')}
-        ${admin ? `<footer><button type="button" class="tf-btn" onclick="swMoveSlPrompt(${t.id}, ${t.sl})">Change SL</button>
+        ${admin ? `<footer><button type="button" class="tf-btn" onclick="swEditTrade(${t.id})">Edit</button>
             <button type="button" class="tf-btn sw-danger" onclick="swExit(${t.id}, '${t.status}')">${t.status === 'pending' ? 'Cancel entry' : 'Exit now'}</button></footer>` : ''}
     </article>`;
+}
+
+function swPendingText(t) {
+    if (t.mode === 'paper') {
+        return t.paper_order === 'limit' ? `waiting: buys when price falls to ${swRs(t.entry)} or lower`
+            : `waiting: buys when price rises to ${swRs(t.entry)} (breakout)`;
+    }
+    return t.mode === 'gtt' ? `buy-stop GTT on Dhan at ${swRs(t.entry)}` : `limit order on Dhan at ${swRs(t.entry)}`;
+}
+
+let _swTradesCache = [];
+
+async function swEditTrade(id) {
+    const t = _swTradesCache.find(x => x.id === id);
+    if (!t) return;
+    const pending = t.status === 'pending';
+    const live = t.mode !== 'paper';
+    const note = !live ? 'Paper trade: values change in the app only.'
+        : pending ? (t.mode === 'gtt' ? 'The buy-stop GTT on Dhan is modified (entry / quantity).' : 'A pending limit order cannot be changed: cancel and enter again. Stop and targets apply after the fill.')
+        : 'The OCO GTT on Dhan is modified (stop-loss and/or target leg).';
+    const fld = (n, label, v, dis) => `<label>${label}<input name="${n}" type="number" step="${n === 'qty' ? 1 : 0.05}" value="${v ?? ''}" ${dis ? 'disabled' : ''}></label>`;
+    swDialog(`<h3 id="sw-dialog-title">Edit ${swEsc(t.symbol)} ${t.setup ? swSetupBadge(t.setup) : ''} <span class="sw-tag">${swEsc(t.mode)} · ${swEsc(t.status)}</span></h3>
+        <p class="sw-muted">${swEsc(note)}</p>
+        <form id="sw-edit" class="sw-ticket" onsubmit="event.preventDefault(); swSaveEdit(${t.id})">
+            ${fld('entry', 'Entry ₹', t.entry, !pending || (live && t.mode === 'limit'))}
+            ${fld('qty', 'Quantity', t.qty, !pending || (live && t.mode === 'limit'))}
+            ${fld('stop', 'Stop loss ₹', t.sl)}
+            ${fld('target', 'Target (T2) ₹', t.target)}
+            ${fld('t1', 'T1 (book half) ₹', t.t1)}
+            ${t.mode === 'paper' && pending ? `<fieldset class="sw-otype"><legend>Paper entry type</legend>
+                <label class="sw-check"><input type="radio" name="paper_order" value="stop" ${t.paper_order !== 'limit' ? 'checked' : ''}> Buy-stop — when the price rises to the entry</label>
+                <label class="sw-check"><input type="radio" name="paper_order" value="limit" ${t.paper_order === 'limit' ? 'checked' : ''}> Limit — when the price is at or below the entry</label></fieldset>` : ''}
+            <div id="sw-edit-err" class="sw-alert sw-alert--err" hidden></div>
+            <footer class="sw-dialog-foot"><button type="button" class="tf-btn" onclick="swCloseDialog()">Cancel</button>
+                <button type="submit" class="tf-btn tf-btn--primary">Save</button></footer>
+        </form>`);
+}
+
+async function swSaveEdit(id) {
+    const f = document.getElementById('sw-edit');
+    const err = document.getElementById('sw-edit-err');
+    const body = {};
+    for (const el of f.elements) {
+        if (!el.name || el.disabled) continue;
+        if (el.type === 'radio') { if (el.checked) body[el.name] = el.value; continue; }
+        if (el.value !== '') body[el.name] = +el.value;
+    }
+    const send = () => swJson(`/api/swing/trades/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+    err.hidden = true;
+    try {
+        let r;
+        try { r = await send(); } catch (e) {
+            if (!/confirm the override/i.test(e.message) || !confirm(`${e.message}\n\nProceed anyway?`)) throw e;
+            body.allow_lower = true;
+            r = await send();
+        }
+        swCloseDialog();
+        if (r.changes?.length) alert(r.message);
+        swRenderTrades();
+    } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message;
+    }
 }
 
 async function swTradeAction(url, body, okMsg) {
@@ -5809,12 +6020,6 @@ async function swTradeAction(url, body, okMsg) {
 function swMoveSl(id, sl) {
     if (!confirm(`Move the stop-loss to ${swRs(sl)}? (live trades: the Dhan GTT is modified)`)) return;
     swTradeAction(`/api/swing/trades/${id}/sl`, { new_sl: sl });
-}
-
-function swMoveSlPrompt(id, cur) {
-    const v = prompt(`New stop-loss (current ${swRs(cur)}). Stops can only be raised.`, cur);
-    if (v == null) return;
-    swTradeAction(`/api/swing/trades/${id}/sl`, { new_sl: parseFloat(v) });
 }
 
 function swPartial(id, qty) {
@@ -5910,6 +6115,7 @@ async function swOpenSettings() {
             ${field('max_open_trades', 'Max open trades', '', 1)}
             ${field('max_per_sector', 'Top picks per sector', 'Avoids concentration in one theme', 1)}
             ${field('top_picks', 'Top picks shown', 'The action list never shows more than this', 1)}
+            ${field('example_capital', 'Example capital ₹', 'Used for the “Example with ₹…” profit line on cards and Telegram')}
             ${field('earnings_block_days', 'Skip if results within (days)', 'Results can gap a stock through its stop', 1)}
             ${field('min_turnover_cr', 'Min avg traded value (₹ Cr/day)', 'Liquidity filter: lower values mean more slippage')}
             ${field('min_price', 'Min price ₹', '')}

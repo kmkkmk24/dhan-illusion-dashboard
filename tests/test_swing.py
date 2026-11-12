@@ -354,6 +354,12 @@ class FakeBroker:
     async def get_market_quote_ltp(self, ids, seg):
         return {"data": {seg: {i: {"last_price": self.ltp} for i in ids}}}
 
+    async def get_market_quote_ohlc(self, ids, seg):
+        hi = getattr(self, "high", None) or self.ltp
+        lo = getattr(self, "low", None) or self.ltp
+        return {"data": {seg: {i: {"last_price": self.ltp, "ohlc": {"open": self.ltp, "high": hi, "low": lo,
+                                                                     "close": self.ltp}} for i in ids}}}
+
     async def create_forever_order(self, **kw):
         oid = f"G{len(self.calls)}"
         self.calls.append(("forever", kw))
@@ -494,6 +500,8 @@ def test_api_overview_setups_settings_and_paper_trade(SessionLocal, tmp_path, mo
     assert "counts" in ov and ov["regime"]["label"] in ("uptrend", "caution", "downtrend")
     rows = client.get("/api/swing/setups", params={"setup": "VCP"}).json()
     assert rows and rows[0]["sizing"]["qty"] > 0 and rows[0]["reasons"]
+    assert "chart" not in rows[0]                       # table view stays light
+    assert all(len(r["chart"]) > 50 for r in client.get("/api/swing/setups", params={"setup": "VCP", "full": True}).json())
     full = client.get(f"/api/swing/setups/{rows[0]['id']}").json()
     assert len(full["chart"]) > 50
     assert client.put("/api/swing/settings", json={"risk_per_trade_pct": 9}).status_code == 400
@@ -559,3 +567,243 @@ def test_open_and_pending_trades_warned_when_added_to_surveillance():
     t.status = "pending"
     pend = advise(t, None, END, surveillance={"kind": "ASM-ST", "stage": 1, "desc": ""})["actions"]
     assert pend[0]["action"] == "cancel_entry"
+
+
+# ── paper fills: order types, moves between checks, end-of-day backstop, edits ──
+
+def _paper(db, b, **kw):
+    from backend.services.swing import trades as tr
+
+    req = {"security_id": "501", "mode": "paper", "qty": 10, "entry": 100, "stop": 95, "target": 115, **kw}
+    return db.get(T.Trade, run(tr.open_trade(db, b, req))["trade_id"])
+
+
+def test_paper_limit_fills_on_dip_and_stop_waits_for_breakout(db):
+    from backend.services.swing import trades as tr
+
+    _inst(db)
+    b = FakeBroker()
+    b.ltp = 101
+    t = _paper(db, b, paper_order="limit")
+    assert tr.paper_order_type(t) == "limit"
+    run(tr.monitor(db, b))
+    assert t.status == "pending"                      # 101 > limit 100
+    b.ltp = 99.5
+    run(tr.monitor(db, b))
+    assert t.status == "open" and t.entry_price == 99.5   # limit fills at the better price
+
+
+def test_paper_move_between_checks_counts_but_earlier_range_does_not(db, monkeypatch):
+    from backend.services import market_calendar
+    from backend.services.swing import trades as tr
+
+    monkeypatch.setattr(market_calendar, "is_trading_day", lambda d=None: True)   # any weekday or weekend run
+
+    _inst(db)
+    b = FakeBroker()
+    b.ltp, b.high, b.low = 98, 101, 97                # the day already traded above 100 BEFORE the trade existed
+    t = _paper(db, b)
+    run(tr.monitor(db, b))
+    assert t.status == "pending"                      # old high is not a fill
+    b.ltp, b.high = 98.5, 101                         # no new high since the last check
+    run(tr.monitor(db, b))
+    assert t.status == "pending"
+    b.ltp, b.high = 99, 102                           # spiked to 102 between checks, back to 99 now
+    run(tr.monitor(db, b))
+    assert t.status == "open" and t.entry_price == 100
+    b.ltp, b.low, b.high = 99, 94, 102                # dipped through the stop between checks
+    run(tr.monitor(db, b))
+    assert t.status == "sl_hit" and t.exit_price == 95
+
+
+def test_paper_end_of_day_backstop_uses_daily_candles(db, tmp_path):
+    from backend.services.swing import trades as tr
+
+    _inst(db)
+    b = FakeBroker()
+    b.ltp = 97
+    t = _paper(db, b)
+    t.created_at = pd.Timestamp(END - timedelta(days=7)).to_pydatetime()
+    db.commit()
+    days = sessions(3)
+    df = pd.DataFrame([{"timestamp": pd.Timestamp(days[0]), "open": 98, "high": 101, "low": 97, "close": 100, "volume": 1},
+                       {"timestamp": pd.Timestamp(days[1]), "open": 100, "high": 104, "low": 99, "close": 103, "volume": 1},
+                       {"timestamp": pd.Timestamp(days[2]), "open": 96, "high": 97, "low": 93, "close": 94, "volume": 1}])
+    st = CandleStore(tmp_path / "c")
+    st.save("501", df)
+    run(tr.manage_eod(db, b, st, intel={"events": {}}, today=END))
+    assert t.status == "sl_hit" and t.entry_price == 100 and t.exit_price == 95   # filled day 1, stopped day 3
+
+
+def test_edit_pending_paper_and_open_live_trade(db):
+    from backend.services.swing import trades as tr
+
+    _inst(db)
+    b = FakeBroker()
+    b.ltp = 97
+    t = _paper(db, b)
+    run(tr.update_trade(db, b, t, {"entry": 98, "qty": 20, "stop": 94, "target": 120, "paper_order": "limit"}))
+    assert (t.entry_price, t.quantity, t.sl_price, t.initial_sl, tr.paper_order_type(t)) == (98, 20, 94, 94, "limit")
+    with pytest.raises(Exception):
+        run(tr.update_trade(db, b, t, {"stop": 99}))               # stop above entry
+    # live open trade: stop / target legs modified on Dhan, lowering the stop needs an override
+    db.add(T.Instrument(security_id="777", exchange="NSE", segment="E", symbol="L", trading_symbol="L", instrument_type="ES"))
+    live = T.Trade(security_id="777", symbol="L", trade_type="swing", entry_mode="gtt", status="open", entry_price=100,
+                   sl_price=95, initial_sl=95, target_price=115, t1_price=110, quantity=10, sl_order_id="G9")
+    db.add(live)
+    db.commit()
+    run(tr.update_trade(db, b, live, {"stop": 97, "target": 118}))
+    legs = [c[2]["leg_name"] for c in b.calls if c[0] == "modify"]
+    assert legs == ["STOP_LOSS_LEG", "TARGET_LEG"] and live.sl_price == 97 and live.target_price == 118
+    with pytest.raises(Exception) as e:
+        run(tr.update_trade(db, b, live, {"stop": 96}))
+    assert "override" in str(e.value.detail)
+    run(tr.update_trade(db, b, live, {"stop": 96, "allow_lower": True}))
+    assert live.sl_price == 96
+    with pytest.raises(Exception):
+        run(tr.update_trade(db, b, live, {"entry": 101}))          # filled entry cannot change
+
+
+def test_card_image_and_telegram_notify(SessionLocal, tmp_path, monkeypatch):
+    from backend.api import swing as api
+    import backend.services.telegram_notifier as tn
+
+    client = make_app(SessionLocal, api.router)
+    db = SessionLocal()
+    run(make_engine(db, tmp_path, FakeData()).run())
+    sid = db.query(T.SwingSetup).filter_by(symbol="VCPCO").one().id
+    db.close()
+    r = client.get(f"/api/swing/setups/{sid}/card.png")
+    assert r.status_code == 200 and r.content[1:4] == b"PNG" and len(r.content) > 50_000
+    monkeypatch.setattr(tn, "telegram_is_configured", lambda: False)
+    assert client.post(f"/api/swing/setups/{sid}/notify").status_code == 400
+    sent = {}
+
+    async def fake_photo(**kw):
+        sent.update(kw)
+        return {"ok": True, "message_id": 1}
+
+    monkeypatch.setattr(tn, "telegram_is_configured", lambda: True)
+    monkeypatch.setattr(tn, "send_telegram_photo", fake_photo)
+    r = client.post(f"/api/swing/setups/{sid}/notify")
+    assert r.status_code == 200 and sent["photo"][1:4] == b"PNG"
+    assert sent["caption"] == "AI Based Analysis - Swing Setups (VCP based)"
+
+
+def test_example_trade_on_fixed_capital():
+    from backend.services.swing.settings import example_trade
+
+    x = example_trade(925.85, 875.30, 1027.0, 1077.5, 50000)
+    assert x["qty"] == 54 and x["invested"] == pytest.approx(49995.9)
+    assert x["t1"]["amount"] == pytest.approx(54 * (1027.0 - 925.85)) and x["stop"]["amount"] < 0
+    assert example_trade(60000, 55000, 70000, 80000, 50000)["qty"] == 0      # one share costs more than the capital
+    assert get_settings()["example_capital"] == 50000
+
+
+def test_holding_time_estimate():
+    from backend.services.swing.timing import estimate_days
+
+    df = vcp_frame()
+    e = float(df["close"].iloc[-1])
+    a = estimate_days(df, e, e * 0.95, e * 1.10, e * 1.15)
+    assert a == estimate_days(df, e, e * 0.95, e * 1.10, e * 1.15)          # seeded: same data, same answer
+    assert a["t1"]["median"] <= a["t2"]["median"] and a["t1"]["prob"] >= a["t2"]["prob"]
+    assert a["t1"]["p25"] <= a["t1"]["median"] <= a["t1"]["p75"] <= a["horizon"]
+    near = estimate_days(df, e, e * 0.95, e * 1.03, e * 1.05)
+    assert near["t1"]["median"] <= a["t1"]["median"] and near["t1"]["prob"] > a["t1"]["prob"]   # closer target: sooner, likelier
+    assert estimate_days(df, e, e * 1.01, e * 1.1, e * 1.2) is None         # stop above entry: no estimate
+    assert estimate_days(df.tail(30), e, e * 0.95, e * 1.1, e * 1.2) is None
+
+
+def test_engine_stores_holding_time(db, tmp_path):
+    out = run(make_engine(db, tmp_path, FakeData()).run())
+    assert out["ok"]
+    vcp = db.query(T.SwingSetup).filter_by(symbol="VCPCO").one()
+    tm = json.loads(vcp.detail)["timing"]
+    assert tm and tm["t1"]["prob"] >= 0 and tm["horizon"] == 60
+
+
+# ── consistency across days ───────────────────────────────────────────────
+
+def _next_sessions(n):
+    from backend.services.market_calendar import is_trading_day
+
+    out, d = [], END
+    while len(out) < n:
+        d += timedelta(days=1)
+        if is_trading_day(d):
+            out.append(d)
+    return out
+
+
+def _day_engine(db, tmp_path, data, day):
+    from backend.services.swing.engine import SwingEngine
+
+    async def bhav_fetch(d, client=None):
+        rows = []
+        for sid, (sym, _) in FRAMES.items():
+            df = data.frames[sid]
+            hit = df[df["timestamp"].dt.date == d]
+            if hit.empty:
+                continue
+            last = hit.iloc[0]
+            prev = df[df["timestamp"].dt.date < d].iloc[-1]
+            rows.append({"symbol": sym, "series": "EQ", "date": pd.Timestamp(d), "prev_close": prev.close,
+                         "open": last.open, "high": last.high, "low": last.low, "close": last.close,
+                         "volume": last.volume, "turnover": 1e9, "deliv_pct": 50.0})
+        return pd.DataFrame(rows)
+
+    async def intel():
+        return {"events": {}, "surveillance": {}, "deals": {}}
+
+    async def master():
+        return {"IPOCO": {"isin": "INE103", "listed": (END - timedelta(days=100)).isoformat()}}
+
+    return SwingEngine(db, dhan=data, store=CandleStore(tmp_path / "candles"), bhav_fetch=bhav_fetch,
+                       intel_fetch=intel, master_fetch=master, today=day)
+
+
+def _add_bar(data, sid, day, o, h, l, c, v=600_000):
+    df = data.frames[sid]
+    data.frames[sid] = pd.concat([df, pd.DataFrame([{"timestamp": pd.Timestamp(day), "open": o, "high": h, "low": l,
+                                                      "close": c, "volume": v, "deliv_pct": np.nan}])], ignore_index=True)
+
+
+def test_setups_stay_consistent_through_a_breakout(db, tmp_path):
+    data = FakeData()
+    assert run(make_engine(db, tmp_path, data).run())["ok"]
+    vcp = db.query(T.SwingSetup).filter_by(symbol="VCPCO", setup_type="VCP").one()
+    vid, e, st = vcp.id, vcp.entry, vcp.stop
+    picks_day1 = {r.id for r in db.query(T.SwingSetup).filter_by(top_pick=True)}
+    d2, d3, d4 = _next_sessions(3)
+    for sid in ("102", "103", "104"):                      # other stocks just drift sideways
+        for d in (d2, d3, d4):
+            c = float(data.frames[sid]["close"].iloc[-1])
+            _add_bar(data, sid, d, c, c * 1.003, c * 0.997, c, 100_000)
+
+    # day 2: breakout on volume
+    _add_bar(data, "101", d2, e * 0.995, e * 1.02, e * 0.99, e * 1.012)
+    assert run(_day_engine(db, tmp_path, data, d2).run())["ok"]
+    db.expire_all()
+    vcp = db.get(T.SwingSetup, vid)
+    assert vcp.active and vcp.status == "triggered" and (vcp.entry, vcp.stop) == (e, st)
+
+    # day 3: no base any more, but the setup stays on its original plan
+    _add_bar(data, "101", d3, e * 1.012, e * 1.025, e * 1.005, e * 1.018)
+    assert run(_day_engine(db, tmp_path, data, d3).run())["ok"]
+    db.expire_all()
+    vcp = db.get(T.SwingSetup, vid)
+    assert vcp.active and vcp.status == "triggered" and (vcp.entry, vcp.stop) == (e, st)
+    detail = json.loads(vcp.detail)
+    assert detail["broke_out_on"] == d2.isoformat() and detail["breakout_age"] == 1
+    assert detail["timing"] and detail["timing"]["t1"]["prob"] >= 0          # carried setups get the estimate too
+    still = {r.id for r in db.query(T.SwingSetup).filter_by(top_pick=True)}
+    assert all(i in still for i in picks_day1 if db.get(T.SwingSetup, i).active
+               and db.get(T.SwingSetup, i).status in ("ready", "triggered"))     # incumbents keep their place
+
+    # day 4: back under the entry -> failed breakout, removed
+    _add_bar(data, "101", d4, e * 1.0, e * 1.0, e * 0.96, e * 0.97)
+    assert run(_day_engine(db, tmp_path, data, d4).run())["ok"]
+    db.expire_all()
+    vcp = db.get(T.SwingSetup, vid)
+    assert not vcp.active and vcp.status in ("failed", "invalidated")

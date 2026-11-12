@@ -34,6 +34,7 @@ from backend.services.swing.evaluator import evaluate_plan
 from backend.services.swing.regime import compute_regime
 from backend.services.swing.settings import get_settings, position_size, setup_params
 from backend.services.swing.setups import Candidate, detect_flag, detect_ipo, detect_vcp
+from backend.services.swing.timing import estimate_days
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,7 @@ class SwingEngine:
         self.today = today
         self.settings = get_settings()
         self.params = setup_params()
+        self._px: dict[str, dict] = {}
 
     # ── data sync ──
     async def _sessions_to_load(self, today: date) -> list[date]:
@@ -344,6 +346,7 @@ class SwingEngine:
                         logger.debug("features failed %s: %s", u["symbol"], e)
                         continue
                     rs_vals[sid] = ind.rs_raw(df["close"])
+                    self._px[sid] = {"close": f.close, "high": float(df["high"].iloc[-1])}
                     breadth["n"] += 1
                     breadth["above50"] += int(bool(f.sma50 and f.close > f.sma50))
                     breadth["above200"] += int(bool(f.sma200 and f.close > f.sma200))
@@ -351,8 +354,13 @@ class SwingEngine:
                         breadth["new_highs"] += int(f.close >= f.hi52 * 0.995)
                         breadth["new_lows"] += int(f.close <= f.lo52 * 1.005)
                     for cand in self._detect(df, f, u["symbol"], ipo_info, today):
+                        try:
+                            timing = estimate_days(df, cand.entry, cand.stop, cand.target1, cand.target2)
+                        except Exception as e:      # an estimate must never break the scan
+                            logger.debug("timing failed %s: %s", u["symbol"], e)
+                            timing = None
                         raw.append({"sid": sid, "u": u, "f": f, "cand": cand, "chart": chart_rows(df),
-                                    "overhead": ind.overhead_resistance(df, cand.entry)})
+                                    "overhead": ind.overhead_resistance(df, cand.entry), "timing": timing})
                     if i % 50 == 0:
                         self.store.flush_meta()
                         await asyncio.sleep(0)
@@ -369,12 +377,12 @@ class SwingEngine:
 
                 _stat(phase="ranking")
                 scored = [self._score(r, ranks, sectors, intel, regime, today) for r in raw]
-                picks = self._pick(scored, regime)
                 # Setups are dated by the last session in the data, not the run date: a scan run before
                 # today's bhavcopy uses yesterday's candles, and today's candle must still be replayed.
                 data_day = max(new_days) if new_days else (
                     date.fromisoformat(self.store.meta["bhav_last"]) if self.store.meta.get("bhav_last") else today)
-                saved = self._persist(scored, picks, regime, data_day)
+                saved = self._persist(scored, regime, data_day)
+                picks = self._pick(regime, saved.pop("previous_picks"), data_day)
                 acc = self.evaluate_suggestions(data_day)
 
                 summary = {
@@ -482,6 +490,7 @@ class SwingEngine:
         score = round(min(100.0, score), 1)
         detail = {
             "levels": cand.levels, "metrics": cand.metrics, "smc": cand.smc, "chart": r["chart"],
+            "timing": r.get("timing"),
             "features": {"rs_rating": rs, "mansfield_rs": f.mansfield_rs and round(f.mansfield_rs, 1),
                          "rs_line_new_high": f.rs_line_new_high, "up_down_vol": f.up_down_vol and round(f.up_down_vol, 2),
                          "deliv_recent": f.deliv_recent and round(f.deliv_recent, 1),
@@ -492,7 +501,7 @@ class SwingEngine:
                          "template": f.template, "sma50": f.sma50 and round(f.sma50, 2),
                          "ema21": f.ema21 and round(f.ema21, 2)},
             "event": ev, "deals": deals if deals.get("count") else None, "overhead": overhead, "surveillance": surv,
-            "is_fno": bool(inst.is_fno),
+            "is_fno": bool(inst.is_fno), "wide": cand.wide, "event_blocked": blocked,
         }
         return {
             "sid": r["sid"], "symbol": sym, "name": inst.display_name, "isin": inst.isin, "setup": cand.setup,
@@ -503,32 +512,54 @@ class SwingEngine:
             "risk_pct": cand.risk_pct, "wide": cand.wide, "event_blocked": blocked,
         }
 
-    def _pick(self, scored: list[dict], regime: dict) -> list[dict]:
-        allowed = {"uptrend": {"A+", "A"}, "caution": {"A+"}, "downtrend": set()}[regime["label"]]
-        pool = [s for s in scored if s["status"] in ("ready", "triggered") and s["tier"] in allowed
-                and not s["wide"] and not s["event_blocked"] and (s["rs"] or 0) >= 60]
-        pool.sort(key=lambda s: (-s["score"], s["status"] != "triggered"))
-        picks, seen, per_sector = [], set(), {}
-        for s in pool:
-            if s["sid"] in seen:
-                continue
-            sec = s["sector"] or "?"
-            if per_sector.get(sec, 0) >= int(self.settings["max_per_sector"]):
-                continue
-            picks.append(s)
-            seen.add(s["sid"])
-            per_sector[sec] = per_sector.get(sec, 0) + 1
-            if len(picks) >= int(self.settings["top_picks"]):
-                break
-        for s in picks:
-            s["top_pick"] = True
-        return picks
+    # ── lifecycle ──
+    # A setup keeps its identity across days (consistency):
+    #  * once suggested, its plan (entry / stop / targets) is frozen; fresh levels are only shown as a note
+    #  * after a breakout it stays visible as "Breakout · day N" / Extended until it fails, hits the
+    #    stop or ages out (the detector no longer sees a base once the stock has broken out)
+    #  * a ready/forming setup the detector misses for a day or two is carried on its last plan
+    #  * yesterday's top picks keep their place while they remain actionable
+    GRACE_SESSIONS = 2
+    BREAKOUT_SESSIONS = 5
 
-    def _persist(self, scored: list[dict], picks: list[dict], regime: dict, today: date) -> dict:
+    def _timing(self, sid: str, entry, stop, t1, t2) -> Optional[dict]:
+        """Holding-time estimate for exactly the levels on the card (cheap: ~10 ms from the candle store)."""
+        try:
+            return estimate_days(self.store.load(sid), entry, stop, t1, t2) if entry and stop and t1 and t2 else None
+        except Exception as e:
+            logger.debug("timing failed for %s: %s", sid, e)
+            return None
+
+    def _status_for(self, setup: str, close: float, high: float, entry: float) -> str:
+        from backend.services.swing.setups import classify
+
+        ready = self.params.ipo_ready_pct if setup == "IPO" else None
+        return classify(close, entry, high, 1.0, self.params, ready_pct=ready)
+
+    @staticmethod
+    def _detail(row: SwingSetup) -> dict:
+        try:
+            return json.loads(row.detail or "{}")
+        except ValueError:
+            return {}
+
+    def _mark_days(self, d: dict, today: date, status: str) -> None:
+        """Track the breakout day and the sessions since it (re-runs on the same data day count once)."""
+        days = set(d.get("seen_days") or [])
+        days.add(today.isoformat())
+        d["seen_days"] = sorted(days)[-15:]
+        d["as_of"] = today.isoformat()
+        if status in ("triggered", "extended") and not d.get("broke_out_on"):
+            d["broke_out_on"] = today.isoformat()
+        if d.get("broke_out_on"):
+            d["breakout_age"] = sum(1 for x in d["seen_days"] if x > d["broke_out_on"])
+
+    def _persist(self, scored: list[dict], regime: dict, today: date) -> dict:
         db = self.db
         active = {(r.security_id, r.setup_type): r for r in db.query(SwingSetup).filter(SwingSetup.active.is_(True)).all()}
+        previous_picks = {r.id for r in active.values() if r.top_pick}
         db.query(SwingSetup).filter(SwingSetup.top_pick.is_(True)).update({SwingSetup.top_pick: False})
-        seen, created, updated = set(), 0, 0
+        seen, created, updated, carried, closed = set(), 0, 0, 0, 0
         for s in scored:
             key = (s["sid"], s["setup"])
             seen.add(key)
@@ -540,35 +571,126 @@ class SwingEngine:
                 created += 1
             else:
                 updated += 1
+            prev = self._detail(row) if row.id else {}
+            d = dict(s["detail"])
+            for k in ("seen_days", "broke_out_on"):
+                if prev.get(k):
+                    d[k] = prev[k]
+            entry, stop, t1, t2, risk, status = s["entry"], s["stop"], s["target1"], s["target2"], s["risk_pct"], s["status"]
+            if row.suggested_on is not None and row.plan_entry:
+                # frozen plan: same numbers every day; the detector's fresh levels become a note
+                fresh = {"entry": entry, "stop": stop, "target1": t1, "target2": t2}
+                entry, stop, t1, t2 = row.plan_entry, row.plan_stop, row.plan_t1, row.plan_t2
+                risk = round((entry - stop) / entry * 100, 2)
+                if abs(fresh["entry"] / entry - 1) > 0.005 or abs(fresh["stop"] / stop - 1) > 0.005:
+                    d["fresh_levels"] = fresh
+                    d["timing"] = self._timing(s["sid"], entry, stop, t1, t2)   # estimate for the plan shown
+                px = self._px.get(s["sid"]) or {"close": s["close"], "high": s["close"]}
+                status = self._status_for(s["setup"], px["close"], px["high"], entry) or "forming"
+                if px["close"] < stop:
+                    status = "invalidated"
+            self._mark_days(d, today, status)
             row.name = s["name"]
-            row.status, row.tier, row.score = s["status"], s["tier"], s["score"]
+            row.status, row.tier, row.score = status, s["tier"], s["score"]
             row.components = json.dumps(s["components"])
             row.reasons, row.warnings = json.dumps(s["reasons"]), json.dumps(s["warnings"])
-            row.detail = json.dumps(s["detail"], default=str)
+            row.detail = json.dumps(d, default=str)
             row.sector, row.sector_rank, row.rs_rating, row.regime = s["sector"], s["sector_rank"], s["rs"], regime["label"]
-            row.close, row.entry, row.stop, row.target1, row.target2, row.risk_pct = (
-                s["close"], s["entry"], s["stop"], s["target1"], s["target2"], s["risk_pct"])
-            row.top_pick = bool(s.get("top_pick"))
+            row.close, row.entry, row.stop, row.target1, row.target2, row.risk_pct = s["close"], entry, stop, t1, t2, risk
             row.last_seen = today
-            if row.suggested_on is None and s["status"] in ("ready", "triggered") and s["tier"] in ("A+", "A", "B") \
+            if status == "invalidated":
+                row.active = False
+                closed += 1
+                continue
+            if row.suggested_on is None and status in ("ready", "triggered") and s["tier"] in ("A+", "A", "B") \
                     and not s["wide"]:
                 row.suggested_on = today
-                row.plan_entry, row.plan_stop, row.plan_t1, row.plan_t2 = s["entry"], s["stop"], s["target1"], s["target2"]
+                row.plan_entry, row.plan_stop, row.plan_t1, row.plan_t2 = entry, stop, t1, t2
                 row.plan_score, row.plan_tier, row.plan_regime = s["score"], s["tier"], regime["label"]
-                row.plan_top_pick = bool(s.get("top_pick"))
                 row.eval_status = "pending"
-            elif row.suggested_on == today and s.get("top_pick"):
-                row.plan_top_pick = True
-        closed = 0
+
         for key, row in active.items():
             if key in seen:
                 continue
-            row.active = False
-            row.top_pick = False
-            row.status = "invalidated" if (row.close and row.stop and row.close < row.stop) else "expired"
-            closed += 1
+            outcome = self._carry(row, today)
+            if outcome == "carried":
+                carried += 1
+            else:
+                row.active = False
+                row.status = outcome
+                closed += 1
         db.commit()
-        return {"created": created, "updated": updated, "closed": closed}
+        return {"created": created, "updated": updated, "carried": carried, "closed": closed,
+                "previous_picks": previous_picks}
+
+    def _carry(self, row: SwingSetup, today: date) -> str:
+        """A setup the detector did not find today: keep it on its last plan, or say why it ended."""
+        px = self._px.get(row.security_id)
+        if px is None or not row.entry or not row.stop:
+            return "expired"
+        close, high = px["close"], px["high"]
+        d = self._detail(row)
+        if close < row.stop:
+            return "invalidated"
+        if d.get("broke_out_on") or row.status in ("triggered", "extended") or close >= row.entry:
+            if close < row.entry * 0.98:
+                return "failed"                       # closed back inside the base: failed breakout
+            if close < row.entry:
+                status = "ready"                      # retest of the pivot: the buy-stop at the entry still applies
+            else:
+                status = "triggered" if close <= row.entry * (1 + self.params.max_chase_pct / 100) else "extended"
+            self._mark_days(d, today, status)
+            if d.get("breakout_age", 0) > self.BREAKOUT_SESSIONS:
+                return "expired"
+        else:
+            status = self._status_for(row.setup_type, close, high, row.entry)
+            if status not in ("ready", "forming"):
+                return "expired"
+            missed = d.get("missed_days") or []
+            if today.isoformat() not in missed:
+                missed.append(today.isoformat())
+            d["missed_days"] = missed[-10:]
+            if len(missed) > self.GRACE_SESSIONS:
+                return "expired"
+            self._mark_days(d, today, status)
+        d["carried"] = True
+        d["timing"] = self._timing(row.security_id, row.entry, row.stop, row.target1, row.target2)
+        row.status, row.close = status, round(close, 2)
+        row.detail = json.dumps(d, default=str)
+        return "carried"
+
+    def _pick(self, regime: dict, previous: set, today: date) -> list[SwingSetup]:
+        """Top picks from the stored lifecycle: yesterday's picks keep their place while still actionable."""
+        allowed = {"uptrend": {"A+", "A"}, "caution": {"A+"}, "downtrend": set()}[regime["label"]]
+        rows = self.db.query(SwingSetup).filter(SwingSetup.active.is_(True), SwingSetup.dismissed.isnot(True)).all()
+
+        def eligible(r: SwingSetup) -> bool:
+            d = self._detail(r)
+            return (r.status in ("ready", "triggered") and r.tier in allowed and not d.get("wide")
+                    and not d.get("event_blocked") and (r.rs_rating or 0) >= 60)
+
+        pool = [r for r in rows if eligible(r)]
+        incumbents = sorted([r for r in pool if r.id in previous], key=lambda r: -(r.score or 0))
+        newcomers = sorted([r for r in pool if r.id not in previous],
+                           key=lambda r: (-(r.score or 0), r.status != "triggered"))
+        picks, seen, per_sector = [], set(), {}
+        for r in incumbents + newcomers:
+            if r.security_id in seen:
+                continue
+            sec = r.sector or "?"
+            if per_sector.get(sec, 0) >= int(self.settings["max_per_sector"]):
+                continue
+            picks.append(r)
+            seen.add(r.security_id)
+            per_sector[sec] = per_sector.get(sec, 0) + 1
+            if len(picks) >= int(self.settings["top_picks"]):
+                break
+        for r in picks:
+            r.top_pick = True
+            if r.suggested_on == today:
+                r.plan_top_pick = True
+        self.db.commit()
+        return picks
 
     # ── accuracy ──
     def evaluate_suggestions(self, today: date) -> int:

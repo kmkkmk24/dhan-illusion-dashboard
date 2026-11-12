@@ -16,7 +16,7 @@ from backend.models.tables import SwingSetup, Trade
 from backend.services.swing import engine as eng
 from backend.services.swing import evaluator as ev
 from backend.services.swing import trades as tr
-from backend.services.swing.settings import get_settings, save_settings
+from backend.services.swing.settings import example_trade, get_settings, save_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/swing", tags=["swing"])
@@ -43,8 +43,12 @@ def setup_out(r: SwingSetup, *, full: bool = False) -> dict:
         "rr": round((r.target2 - r.entry) / (r.entry - r.stop), 1) if r.entry and r.stop and r.target2 and r.entry > r.stop else None,
         "levels": detail.get("levels"), "metrics": detail.get("metrics"), "smc": detail.get("smc"),
         "features": detail.get("features"), "event": detail.get("event"), "deals": detail.get("deals"),
-        "is_fno": detail.get("is_fno"), "surveillance": detail.get("surveillance"),
+        "is_fno": detail.get("is_fno"), "surveillance": detail.get("surveillance"), "timing": detail.get("timing"),
+        "broke_out_on": detail.get("broke_out_on"), "breakout_age": detail.get("breakout_age"),
+        "carried": bool(detail.get("carried")), "fresh_levels": detail.get("fresh_levels"),
         "sizing": eng.sizing_for(r.entry, r.stop, r.regime) if r.entry and r.stop else None,
+        "example": example_trade(r.entry, r.stop, r.target1, r.target2, float(get_settings()["example_capital"]))
+        if r.entry and r.stop else None,
         "suggested_on": str(r.suggested_on) if r.suggested_on else None, "eval_status": r.eval_status,
     }
     if full:
@@ -106,6 +110,7 @@ def list_setups(
     setup: Optional[str] = Query(None, description="VCP / FLAG / IPO"),
     status: Optional[str] = Query(None, description="comma list: triggered,ready,forming,extended"),
     min_tier: Optional[str] = Query(None, description="A+ / A / B / C"),
+    full: bool = Query(False, description="include the chart (for card view)"),
     db: Session = Depends(get_db),
 ):
     q = db.query(SwingSetup).filter(SwingSetup.active.is_(True), SwingSetup.dismissed.isnot(True))
@@ -119,7 +124,7 @@ def list_setups(
         rows = [r for r in rows if order.get(r.tier or "C", 3) <= order[min_tier]]
     st_order = {"triggered": 0, "ready": 1, "forming": 2, "extended": 3}
     rows.sort(key=lambda r: (not r.top_pick, st_order.get(r.status, 9), -(r.score or 0)))
-    return [setup_out(r) for r in rows]
+    return [setup_out(r, full=full) for r in rows]
 
 
 @router.get("/setups/{setup_id}")
@@ -128,6 +133,44 @@ def get_setup(setup_id: int, db: Session = Depends(get_db)):
     if not r:
         raise HTTPException(404, "Setup not found")
     return setup_out(r, full=True)
+
+
+def _card_png(r: SwingSetup) -> bytes:
+    from backend.services.swing.card import render_setup_card
+
+    last = eng.load_last_run()
+    return render_setup_card(setup_out(r, full=True), regime=last.get("regime"), as_of=last.get("as_of"))
+
+
+@router.get("/setups/{setup_id}/card.png")
+async def setup_card(setup_id: int, db: Session = Depends(get_db)):
+    """The Telegram image card (preview / download)."""
+    from fastapi.responses import Response
+
+    r = db.get(SwingSetup, setup_id)
+    if not r:
+        raise HTTPException(404, "Setup not found")
+    png = await asyncio.to_thread(_card_png, r)
+    return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@router.post("/setups/{setup_id}/notify")
+async def notify_setup(setup_id: int, db: Session = Depends(get_db)):
+    """Render the setup's image card and send it to the configured Telegram chat."""
+    from backend.services.swing.card import build_caption
+    from backend.services.telegram_notifier import send_telegram_photo, telegram_is_configured
+
+    r = db.get(SwingSetup, setup_id)
+    if not r:
+        raise HTTPException(404, "Setup not found")
+    if not telegram_is_configured():
+        raise HTTPException(400, "Telegram is not configured: add the bot token and chat id in Settings")
+    png = await asyncio.to_thread(_card_png, r)
+    res = await send_telegram_photo(photo=png, caption=build_caption(setup_out(r, full=True)),
+                                    filename=f"{r.symbol}_{r.setup_type}.png")
+    if not res.get("ok"):
+        raise HTTPException(502, f"Telegram did not accept the card: {res.get('error') or res.get('reason')}")
+    return {"ok": True, "message": f"{r.symbol} card sent to Telegram"}
 
 
 @router.post("/setups/{setup_id}/dismiss")
@@ -191,6 +234,7 @@ def trade_out(t: Trade, ltp: Optional[float] = None) -> dict:
         "unrealized": round(unreal, 2) if unreal is not None else None, "pnl": t.pnl, "pnl_pct": t.pnl_percentage,
         "protected": bool(t.sl_order_id) if t.entry_mode != "paper" else None, "protection_note": t.protection_note,
         "advice": _j(t.advice, {}), "days_held": t.days_held, "notes": t.notes, "peak": t.peak_price,
+        "paper_order": tr.paper_order_type(t) if t.entry_mode == "paper" else None,
     }
 
 
@@ -234,6 +278,12 @@ def _trade(db: Session, trade_id: int) -> Trade:
 @router.post("/trades")
 async def create_trade(req: dict = Body(...), db: Session = Depends(get_db)):
     return await _with_client(lambda c: tr.open_trade(db, c, req))
+
+
+@router.put("/trades/{trade_id}")
+async def edit_trade(trade_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    t = _trade(db, trade_id)
+    return await _with_client(lambda c: tr.update_trade(db, c, t, body))
 
 
 @router.post("/trades/{trade_id}/sl")

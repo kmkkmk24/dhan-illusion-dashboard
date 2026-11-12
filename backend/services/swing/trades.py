@@ -85,6 +85,39 @@ def _ltp_map(raw: Any) -> dict[str, float]:
     return out
 
 
+def _quote_map(raw: Any) -> dict[str, dict]:
+    """/marketfeed/ohlc -> {sid: {'ltp', 'high', 'low'}} (day high/low so far)."""
+    out = {}
+    data = (raw or {}).get("data") if isinstance(raw, dict) else None
+    for seg in (data or {}).values():
+        if not isinstance(seg, dict):
+            continue
+        for sid, info in seg.items():
+            try:
+                o = info.get("ohlc") or {}
+                ltp = float(info.get("last_price") or 0)
+                hi, lo = float(o.get("high") or 0), float(o.get("low") or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if ltp > 0:
+                out[str(sid)] = {"ltp": ltp, "high": hi if hi >= ltp else ltp, "low": lo if 0 < lo <= ltp else ltp}
+    return out
+
+
+async def live_quotes(client, security_ids: list[str]) -> dict[str, dict]:
+    """LTP plus the day's high/low (one call); falls back to LTP only."""
+    ids = sorted({str(s) for s in security_ids if s})
+    if not ids:
+        return {}
+    try:
+        q = _quote_map(await client.get_market_quote_ohlc(ids, SEG))
+        if q:
+            return q
+    except Exception as e:
+        logger.warning("Swing OHLC quote failed: %s", e)
+    return {sid: {"ltp": v, "high": v, "low": v} for sid, v in (await live_prices(client, ids)).items()}
+
+
 async def live_prices(client, security_ids: list[str]) -> dict[str, float]:
     ids = sorted({str(s) for s in security_ids if s})
     if not ids:
@@ -151,10 +184,15 @@ async def open_trade(db: Session, client, req: dict) -> dict:
     result: dict[str, Any] = {"mode": mode}
 
     if mode == "paper":
+        order = str(req.get("paper_order") or "stop").lower()
+        if order not in ("stop", "limit"):
+            raise HTTPException(400, "paper_order must be stop (buy on breakout) or limit (buy at or below)")
         fill = float(req.get("fill_price") or 0)
         if fill > 0 or req.get("already_filled"):
             trade.status, trade.entry_price, trade.entry_date = "open", fill or entry, date.today()
             trade.peak_price = trade.entry_price
+        q = (await live_quotes(client, [sid])).get(sid) if client is not None else None
+        _paper_state(trade, order=order, quote=q, reset=True)
         db.add(trade)
         db.commit()
         db.refresh(trade)
@@ -293,7 +331,8 @@ async def monitor(db: Session, client) -> list[dict]:
     if not rows:
         return []
     events: list[dict] = []
-    prices = await live_prices(client, [t.security_id for t in rows])
+    quotes = await live_quotes(client, [t.security_id for t in rows])
+    prices = {k: v["ltp"] for k, v in quotes.items()}
     live = [t for t in rows if t.entry_mode in ("gtt", "limit")]
     book, gtts = [], []
     if live:
@@ -305,7 +344,7 @@ async def monitor(db: Session, client) -> list[dict]:
         ltp = prices.get(t.security_id)
         try:
             if t.entry_mode == "paper":
-                ev = _monitor_paper(t, ltp)
+                ev = _monitor_paper(t, quotes.get(t.security_id))
             else:
                 ev = await _monitor_live(db, client, t, ltp, book, gtt_status)
             if ltp:
@@ -323,22 +362,110 @@ async def monitor(db: Session, client) -> list[dict]:
     return events
 
 
-def _monitor_paper(t: Trade, ltp: Optional[float]) -> Optional[dict]:
-    if not ltp:
+def _write_state(t: Trade, st: dict) -> None:
+    a = _advice(t)
+    a["paper"] = st
+    t.advice = json.dumps(a, default=str)
+
+
+def _paper_state(t: Trade, *, order: Optional[str] = None, quote: Optional[dict] = None, reset: bool = False) -> dict:
+    """
+    Paper-trade watch state (kept in the advice JSON): the order type plus the day's high/low
+    already seen. A move through a level BETWEEN two 2-minute checks still counts (Dhan's day
+    high/low captures it), while the range traded before the trade existed does not.
+    """
+    st = dict(_advice(t).get("paper") or {})
+    if order:
+        st["order"] = order
+    today = date.today().isoformat()
+    if reset or st.get("day") != today:
+        st.update(day=today, hi=None, lo=None)
+    if quote and reset:
+        from backend.services.market_calendar import is_trading_day
+
+        if is_trading_day():          # today's range so far happened before the trade: ignore it
+            st.update(hi=quote["high"], lo=quote["low"])
+    _write_state(t, st)
+    return st
+
+
+def paper_order_type(t: Trade) -> str:
+    return (_advice(t).get("paper") or {}).get("order") or "stop"
+
+
+def _monitor_paper(t: Trade, q: Optional[dict]) -> Optional[dict]:
+    if not q or not q.get("ltp"):
         return None
+    st = _paper_state(t)
+    ltp, hi, lo = q["ltp"], q["high"], q["low"]
+    new_hi = hi if (st.get("hi") is None or hi > st["hi"]) else None    # a high made since the last check
+    new_lo = lo if (st.get("lo") is None or lo < st["lo"]) else None
+    ev = None
     if t.status == "pending":
-        if ltp >= float(t.entry_price):
+        e = float(t.entry_price)
+        filled = False
+        if st.get("order") == "limit":
+            if ltp <= e or (new_lo is not None and new_lo <= e):
+                t.entry_price = round(min(e, ltp), 2)
+                filled = True
+        elif ltp >= e or (new_hi is not None and new_hi >= e):
+            t.entry_price = round(ltp, 2) if ltp > e * 1.01 else e       # a gap above the trigger fills higher
+            filled = True
+        if filled:
             t.status, t.entry_date, t.peak_price = "open", date.today(), ltp
-            t.entry_price = round(max(ltp, float(t.entry_price)), 2) if ltp > t.entry_price * 1.01 else t.entry_price
+            st.update(hi=hi, lo=lo)              # exits only count moves after the fill
+            _write_state(t, st)
             return {"event": "filled", "price": t.entry_price}
+    else:
+        sl, tgt = float(t.sl_price), float(t.target_price)
+        if ltp <= sl or (new_lo is not None and new_lo <= sl):             # stop first when both were touched
+            px = round(min(ltp, sl), 2)
+            _close(t, px, "sl_hit", "Stop loss hit")
+            ev = {"event": "sl_hit", "price": px}
+        elif ltp >= tgt or (new_hi is not None and new_hi >= tgt):
+            px = round(ltp, 2) if ltp >= tgt else tgt
+            _close(t, px, "target_hit", "Target hit")
+            ev = {"event": "target_hit", "price": px}
+        if t.status == "open":
+            t.peak_price = max(float(t.peak_price or 0), hi)
+    st.update(hi=max(hi, st["hi"]) if st.get("hi") is not None else hi,
+              lo=min(lo, st["lo"]) if st.get("lo") is not None else lo)
+    _write_state(t, st)
+    return ev
+
+
+def paper_eod(t: Trade, df: Optional[pd.DataFrame]) -> Optional[dict]:
+    """Backstop after the close: replay the official daily candles after the trade's start day."""
+    if df is None or df.empty or t.entry_mode != "paper":
         return None
-    if ltp <= float(t.sl_price):
-        _close(t, ltp, "sl_hit", "Stop loss hit")
-        return {"event": "sl_hit", "price": ltp}
-    if ltp >= float(t.target_price):
-        _close(t, ltp, "target_hit", "Target hit")
-        return {"event": "target_hit", "price": ltp}
-    return None
+    start = t.entry_date if t.status == "open" else (t.created_at.date() if t.created_at else None)
+    if start is None:
+        return None
+    ev = None
+    for r in df[df["timestamp"].dt.date > start].itertuples(index=False):
+        if t.status == "pending":
+            e = float(t.entry_price)
+            if paper_order_type(t) == "limit" and r.low <= e:
+                t.entry_price = round(min(e, r.open), 2)
+            elif paper_order_type(t) != "limit" and r.high >= e:
+                t.entry_price = round(max(e, r.open), 2)
+            else:
+                continue
+            t.status, t.entry_date, t.peak_price = "open", r.timestamp.date(), r.high
+            ev = {"event": "filled", "price": t.entry_price}
+            continue                         # same-day exits are ambiguous: judged from the next candle
+        if r.low <= float(t.sl_price):
+            px = round(min(float(t.sl_price), r.open), 2)
+            _close(t, px, "sl_hit", "Stop loss hit (daily candle)")
+            t.exit_date = r.timestamp.date()
+            return {"event": "sl_hit", "price": px}
+        if r.high >= float(t.target_price):
+            px = round(max(float(t.target_price), r.open), 2)
+            _close(t, px, "target_hit", "Target hit (daily candle)")
+            t.exit_date = r.timestamp.date()
+            return {"event": "target_hit", "price": px}
+        t.peak_price = max(float(t.peak_price or 0), r.high)
+    return ev
 
 
 async def _monitor_live(db: Session, client, t: Trade, ltp: Optional[float], book: list[dict],
@@ -487,6 +614,10 @@ async def manage_eod(db: Session, client, store, intel: Optional[dict] = None, t
     s = get_settings()
     out = []
     for t in swing_trades(db, ("open", "pending")):
+        if t.entry_mode == "paper":
+            paper_eod(t, store.load(t.security_id))
+            if t.status not in OPEN_STATES:
+                continue
         df = store.load(t.security_id) if t.status == "open" else None
         ev = nse_data.next_event(intel, t.symbol, today, 5)
         adv = advise(t, df, today, ev["days"] if ev else None, nse_data.surveillance_info(intel, t.symbol))
@@ -530,6 +661,88 @@ async def apply_sl(db: Session, client, trade: Trade, new_sl: float, *, allow_lo
     _set_advice(trade, actions=[x for x in _advice(trade).get("actions", []) if x.get("action") != "move_sl"])
     db.commit()
     return {"ok": True, "sl": new_sl}
+
+
+async def update_trade(db: Session, client, trade: Trade, body: dict) -> dict:
+    """
+    Edit a swing trade's plan.
+      pending: entry, stop, target, T1, quantity (+ paper order type). A live buy-stop GTT is modified
+               on Dhan; a pending live limit order must be cancelled and re-entered instead.
+      open:    stop, target, T1. Live trades modify the OCO legs on Dhan. Lowering a stop needs
+               allow_lower (it only adds risk).
+    """
+    if trade.status not in OPEN_STATES:
+        raise HTTPException(400, f"Trade is already {trade.status}")
+
+    def num(key, cur):
+        v = body.get(key)
+        if v in (None, ""):
+            return cur
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{key} must be a number")
+        if x <= 0:
+            raise HTTPException(400, f"{key} must be above 0")
+        return x
+
+    entry = num("entry", float(trade.entry_price))
+    stop = num("stop", float(trade.sl_price))
+    target = num("target", float(trade.target_price))
+    t1 = num("t1", float(trade.t1_price or 0) or None)
+    qty = int(num("qty", int(trade.quantity or 0)))
+    if trade.status == "open" and (entry != float(trade.entry_price) or qty != int(trade.quantity or 0)):
+        raise HTTPException(400, "Entry and quantity of a filled trade cannot change (book partial / exit instead)")
+    if not (stop < entry < target):
+        raise HTTPException(400, "Require stop < entry < target")
+    if t1 is not None and not (entry < t1 <= target):
+        raise HTTPException(400, "T1 must be between the entry and the target")
+    if trade.status == "open" and stop < float(trade.sl_price) and not body.get("allow_lower"):
+        raise HTTPException(400, "Refusing to LOWER the stop of an open trade (that only increases risk); "
+                                 "confirm the override to do it anyway")
+    order = body.get("paper_order")
+    if order not in (None, "", "stop", "limit"):
+        raise HTTPException(400, "paper_order must be stop or limit")
+
+    live = trade.entry_mode != "paper"
+    changes = []
+    if live and trade.status == "pending":
+        if trade.entry_mode == "limit" and (entry != float(trade.entry_price) or qty != int(trade.quantity)):
+            raise HTTPException(409, "A pending limit order cannot be modified here: cancel the entry and place it again")
+        if trade.entry_mode == "gtt" and (entry != float(trade.entry_price) or qty != int(trade.quantity)):
+            res = await client.modify_forever_order(
+                trade.buy_order_id, order_flag="SINGLE", leg_name="TARGET_LEG", order_type="LIMIT", quantity=qty,
+                price=_tick(entry * (1 + ENTRY_LIMIT_BUFFER)), trigger_price=_tick(entry))
+            if osf.is_error(res):
+                raise HTTPException(400, f"Dhan rejected the entry change: {osf.error_detail(res)}")
+            changes.append("entry GTT modified on Dhan")
+    if live and trade.status == "open" and trade.sl_order_id:
+        if stop != float(trade.sl_price):
+            res = await client.modify_forever_order(
+                trade.sl_order_id, order_flag="OCO", leg_name="STOP_LOSS_LEG", order_type="LIMIT",
+                quantity=int(trade.quantity), price=_tick(stop * (1 - SL_LIMIT_BUFFER)), trigger_price=_tick(stop))
+            if osf.is_error(res):
+                raise HTTPException(400, f"Dhan rejected the stop change: {osf.error_detail(res)}")
+            changes.append("stop-loss leg modified on Dhan")
+        if target != float(trade.target_price):
+            res = await client.modify_forever_order(
+                trade.sl_order_id, order_flag="OCO", leg_name="TARGET_LEG", order_type="LIMIT",
+                quantity=int(trade.quantity), price=_tick(target), trigger_price=_tick(target))
+            if osf.is_error(res):
+                raise HTTPException(400, f"Dhan rejected the target change: {osf.error_detail(res)}")
+            changes.append("target leg modified on Dhan")
+
+    if trade.status == "pending":
+        trade.entry_price, trade.quantity, trade.initial_sl = round(entry, 2), qty, round(stop, 2)
+    trade.sl_price, trade.target_price = _tick(stop), _tick(target)
+    trade.t1_price = round(t1, 2) if t1 else round(entry + 2 * (entry - stop), 2)
+    trade.risk_reward_ratio = round((target - entry) / (entry - stop), 2)
+    if trade.entry_mode == "paper" and order:
+        st = dict(_advice(trade).get("paper") or {})
+        st["order"] = order
+        _write_state(trade, st)
+    db.commit()
+    return {"ok": True, "changes": changes, "message": "Trade updated" + (f" ({'; '.join(changes)})" if changes else "")}
 
 
 async def book_partial(db: Session, client, trade: Trade, qty: int, price: Optional[float] = None) -> dict:

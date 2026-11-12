@@ -29,6 +29,7 @@ DEFAULTS: dict[str, Any] = {
     "bhav_seed_sessions": 25,       # first run: sessions of bhavcopy to load (delivery %, turnover)
     # ranking
     "top_picks": 8,                 # the action list never shows more than this
+    "example_capital": 50000.0,     # "what if I put this much in" profit example on cards and Telegram
     "earnings_block_days": 7,       # no top pick when results are due within this many days
     "max_wait_days": 10,            # accuracy: sessions allowed for an entry to trigger
     "max_hold_days": 30,            # accuracy: time stop for the evaluation
@@ -64,6 +65,7 @@ _LIMITS = {
     "capital": (10000, 1e10), "risk_per_trade_pct": (0.1, 3.0), "max_position_pct": (2, 100),
     "max_open_trades": (1, 30), "max_per_sector": (1, 10), "min_price": (1, 100000), "max_price": (0, 1e6),
     "min_turnover_cr": (0.5, 1000), "top_picks": (1, 25), "earnings_block_days": (0, 30),
+    "example_capital": (1000, 1e9),
 }
 
 
@@ -99,6 +101,20 @@ def setup_params() -> SetupParams:
         if hasattr(p, k):
             setattr(p, k, type(getattr(p, k))(v))
     return p
+
+
+def example_trade(entry: float, stop: float, t1: float, t2: float, capital: float) -> dict:
+    """Whole shares bought with `capital` at the entry, and the rupee result at T1, T2 and the stop."""
+    if not entry or entry <= 0:
+        return {"capital": capital, "qty": 0}
+    qty = int(capital // entry)
+    inv = qty * entry
+
+    def res(px):
+        return {"amount": round(qty * (px - entry), 2), "pct": round((px / entry - 1) * 100, 2)} if px else None
+
+    return {"capital": capital, "qty": qty, "invested": round(inv, 2),
+            "t1": res(t1), "t2": res(t2), "stop": res(stop)}
 
 
 def position_size(entry: float, stop: float, settings: dict, risk_mult: float = 1.0) -> dict:

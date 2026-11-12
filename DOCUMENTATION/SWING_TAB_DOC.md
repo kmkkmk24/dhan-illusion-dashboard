@@ -61,6 +61,21 @@ market regime: uptrend → A+/A, caution → A+ only, downtrend → none.
 **Market regime** (`regime.py`): Nifty vs 21-EMA / 50 / 200-DMA and slope (60 pts) + breadth of the
 universe (% above 50-DMA, 52-week highs vs lows, 40 pts). Position size ×1 / ×0.5 / blocked.
 
+## Consistency across days (setup lifecycle)
+
+A setup keeps its identity (one `swing_setups` row) from the day it is found until it ends:
+
+* **Frozen plan** — once suggested (ready/breakout, grade B+), entry / stop / targets never move. If the
+  pattern's fresh levels differ, they are shown as a note only.
+* **After a breakout** the detector no longer sees a base, so the setup is *carried* on its plan:
+  `Breakout · day N` within 4% above the entry, `Extended` above that, `Ready` on a retest within 2%
+  under the entry. It ends as **failed** (close > 2% under the entry), **invalidated** (stop broken) or
+  **expired** (more than 5 sessions after the breakout).
+* **Grace** — a ready/forming setup the detector misses (one-candle change) is carried on its last plan
+  for up to 2 sessions.
+* **Incumbent top picks** — yesterday's picks keep their place while still actionable; only free slots
+  go to new names.
+
 ## Trades (`trades.py`)
 
 Modes: **paper** (tracked only), **gtt** (Dhan Forever Order BUY, trigger = entry, limit +0.5%: a buy-stop

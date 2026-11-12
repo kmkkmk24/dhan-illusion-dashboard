@@ -46,6 +46,7 @@ venv.bak/
 *.sqlite3
 data/trades.db
 data/backups/
+data/techno_funda_cache/
 
 # Logs
 *.log

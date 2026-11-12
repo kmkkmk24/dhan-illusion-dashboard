@@ -111,6 +111,224 @@ function initSidebar() {
     if (collapsed) document.querySelector('.sidebar').classList.add('collapsed');
 }
 
+// --- Sidebar menu: grouped flyouts + reordering (drag-and-drop or ▲/▼ on hover; saved per browser) ---
+//
+// Top-level entries (.sidebar-nav children) are tabs or .nav-group menus. Each group's
+// .nav-submenu is moved to <body> at init and shown as a fixed flyout on hover: the
+// sidebar uses backdrop-filter + overflow:hidden, which would clip it in place.
+// Order is kept per container: { nav: [...], longterm: [...], fo: [...] }.
+
+const TAB_ORDER_KEY = 'nav-tab-order-v2';
+const _NAV_ARROW_UP = '<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>';
+const _NAV_ARROW_DOWN = '<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+let _navInitDone = false;
+let _navDragging = null;
+
+function _navRoot() { return document.querySelector('.sidebar-nav'); }
+function _navSubmenu(key) { return document.querySelector(`.nav-submenu[data-group="${key}"]`); }
+function _navContainers() { return [_navRoot(), ...document.querySelectorAll('.nav-submenu')].filter(Boolean); }
+function _navContainerKey(c) { return c.classList.contains('nav-submenu') ? c.dataset.group : 'nav'; }
+function _navEntries(c) {
+    return Array.from(c.children).filter(el => el.classList.contains('nav-item') || el.classList.contains('nav-group'));
+}
+function _navKey(el) {
+    return el.classList.contains('nav-group') ? `group:${el.dataset.group}` : el.id.replace(/^tab-/, '');
+}
+
+function _saveTabOrder() {
+    const order = {};
+    _navContainers().forEach(c => { order[_navContainerKey(c)] = _navEntries(c).map(_navKey); });
+    try { localStorage.setItem(TAB_ORDER_KEY, JSON.stringify(order)); } catch (_) {}
+}
+
+function _applySavedTabOrder() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(TAB_ORDER_KEY) || 'null'); } catch (_) {}
+    if (!saved || typeof saved !== 'object') return;
+    _navContainers().forEach(c => {
+        const keys = saved[_navContainerKey(c)];
+        if (!Array.isArray(keys)) return;
+        const byKey = new Map(_navEntries(c).map(el => [_navKey(el), el]));
+        // Saved entries first in saved order; anything new keeps its default spot after them.
+        const ordered = keys.map(k => byKey.get(k)).filter(Boolean);
+        _navEntries(c).forEach(el => { if (!ordered.includes(el)) ordered.push(el); });
+        ordered.forEach(el => c.appendChild(el));
+    });
+}
+
+/** Tab to open on load: the first one (in the user's order) they can see. */
+function firstNavTab() {
+    const root = _navRoot();
+    if (!root) return 'sectors';
+    for (const el of _navEntries(root)) {
+        if (el.style.display === 'none') continue;
+        if (!el.classList.contains('nav-group')) return _navKey(el);
+        const menu = _navSubmenu(el.dataset.group);
+        const first = menu && _navEntries(menu).find(s => s.style.display !== 'none');
+        if (first) return _navKey(first);
+    }
+    return 'sectors';
+}
+
+function _moveNavEntry(el, delta) {
+    const siblings = _navEntries(el.parentElement);
+    const target = siblings[siblings.indexOf(el) + delta];
+    if (!target) return;
+    if (delta < 0) target.before(el); else target.after(el);
+    _saveTabOrder();
+}
+
+/** Highlight a group's header when one of its tabs is open. Called from switchTab. */
+function syncNavGroupActive() {
+    document.querySelectorAll('.nav-group').forEach(group => {
+        const menu = _navSubmenu(group.dataset.group);
+        const active = menu && menu.querySelector('.nav-sub-item.active');
+        const head = group.querySelector('.nav-group-head');
+        if (!head) return;
+        head.classList.toggle('group-active', !!active);
+        const label = head.querySelector('span')?.textContent || '';
+        head.title = active ? `${label} · ${active.querySelector('span')?.textContent || ''}` : label;
+    });
+}
+
+function _closeNavFlyouts(except) {
+    document.querySelectorAll('.nav-submenu.open').forEach(m => { if (m !== except) m._navHide?.(0); });
+}
+
+function _initNavGroups() {
+    const sidebar = document.querySelector('.sidebar');
+    document.querySelectorAll('.nav-group').forEach(group => {
+        const menu = group.querySelector('.nav-submenu');
+        const head = group.querySelector('.nav-group-head');
+        if (!menu || !head) return;
+        document.body.appendChild(menu);
+
+        let hideTimer = null;
+        const place = () => {
+            const r = head.getBoundingClientRect();
+            const sb = sidebar ? sidebar.getBoundingClientRect() : r;
+            menu.style.left = `${Math.round(sb.right + 6)}px`;
+            const maxTop = window.innerHeight - menu.offsetHeight - 8;
+            menu.style.top = `${Math.round(Math.max(8, Math.min(r.top - 6, maxTop)))}px`;
+        };
+        const show = () => {
+            clearTimeout(hideTimer);
+            _closeNavFlyouts(menu);
+            menu.classList.add('open');
+            head.classList.add('open');
+            head.setAttribute('aria-expanded', 'true');
+            place();
+        };
+        const hide = (delay = 180) => {
+            clearTimeout(hideTimer);
+            hideTimer = setTimeout(() => {
+                if (_navDragging && menu.contains(_navDragging)) return;
+                menu.classList.remove('open');
+                head.classList.remove('open');
+                head.setAttribute('aria-expanded', 'false');
+            }, delay);
+        };
+        menu._navHide = hide;
+
+        group.addEventListener('mouseenter', show);
+        group.addEventListener('mouseleave', () => hide());
+        menu.addEventListener('mouseenter', show);
+        menu.addEventListener('mouseleave', () => hide());
+        head.addEventListener('click', e => {
+            if (e.target.closest('.nav-move')) return;
+            menu.classList.contains('open') ? hide(0) : show();
+        });
+        head.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+                e.preventDefault();
+                show();
+                menu.querySelector('.nav-sub-item')?.focus();
+            } else if (e.key === 'Escape') hide(0);
+        });
+        menu.addEventListener('keydown', e => {
+            const item = e.target.closest('.nav-sub-item');
+            if (item && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); item.click(); }
+            if (e.key === 'Escape' || e.key === 'ArrowLeft') { hide(0); head.focus(); }
+        });
+        menu.addEventListener('click', e => {
+            if (e.target.closest('.nav-sub-item') && !e.target.closest('.nav-move')) hide(0);
+        });
+        menu.querySelectorAll('.nav-sub-item').forEach(item => {
+            item.tabIndex = 0;
+            item.setAttribute('role', 'menuitem');
+        });
+    });
+    document.addEventListener('click', e => {
+        if (!e.target.closest('.nav-group, .nav-submenu')) _closeNavFlyouts(null);
+    });
+    window.addEventListener('resize', () => _closeNavFlyouts(null));
+}
+
+function _addNavMoveControls(entry) {
+    const host = entry.classList.contains('nav-group') ? entry.querySelector('.nav-group-head') : entry;
+    if (!host || host.querySelector('.nav-move')) return;
+    const ctl = document.createElement('span');
+    ctl.className = 'nav-move';
+    ctl.innerHTML =
+        `<button type="button" class="nav-move-btn" title="Move up" aria-label="Move up">${_NAV_ARROW_UP}</button>` +
+        `<button type="button" class="nav-move-btn" title="Move down" aria-label="Move down">${_NAV_ARROW_DOWN}</button>`;
+    const [up, down] = ctl.querySelectorAll('button');
+    up.addEventListener('click', e => { e.stopPropagation(); _moveNavEntry(entry, -1); });
+    down.addEventListener('click', e => { e.stopPropagation(); _moveNavEntry(entry, +1); });
+    const chev = host.querySelector('.nav-group-chev');
+    if (chev) host.insertBefore(ctl, chev); else host.appendChild(ctl);
+}
+
+function _initNavDrag(entry) {
+    entry.draggable = true;
+    entry.addEventListener('dragstart', e => {
+        e.stopPropagation();
+        _navDragging = entry;
+        entry.classList.add('nav-dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', _navKey(entry)); } catch (_) {}
+    });
+    entry.addEventListener('dragend', () => {
+        entry.classList.remove('nav-dragging');
+        document.querySelectorAll('.nav-drop-before, .nav-drop-after')
+            .forEach(n => n.classList.remove('nav-drop-before', 'nav-drop-after'));
+        _navDragging = null;
+    });
+    // Drops are only allowed between entries of the same menu.
+    const sameMenu = () => _navDragging && _navDragging !== entry && _navDragging.parentElement === entry.parentElement;
+    entry.addEventListener('dragover', e => {
+        if (!sameMenu()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const r = entry.getBoundingClientRect();
+        const after = e.clientY > r.top + r.height / 2;
+        entry.classList.toggle('nav-drop-after', after);
+        entry.classList.toggle('nav-drop-before', !after);
+    });
+    entry.addEventListener('dragleave', () => entry.classList.remove('nav-drop-before', 'nav-drop-after'));
+    entry.addEventListener('drop', e => {
+        if (!sameMenu()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const after = entry.classList.contains('nav-drop-after');
+        entry.classList.remove('nav-drop-before', 'nav-drop-after');
+        if (after) entry.after(_navDragging); else entry.before(_navDragging);
+        _saveTabOrder();
+    });
+}
+
+function initTabOrder() {
+    if (_navInitDone || !_navRoot()) return;
+    _navInitDone = true;
+    _initNavGroups();
+    _applySavedTabOrder();
+    _navContainers().forEach(c => _navEntries(c).forEach(entry => {
+        entry.title = entry.title || 'Drag to reorder';
+        _addNavMoveControls(entry);
+        _initNavDrag(entry);
+    }));
+}
+
 // --- Table Sorting ---
 
 function makeTableSortable(tableEl) {
@@ -335,13 +553,14 @@ function switchTab(tab) {
 
     document.getElementById(`content-${tab}`).classList.remove('hidden');
     document.getElementById(`tab-${tab}`).classList.add('active');
+    syncNavGroupActive();
 
     if (tab === 'sectors') {
         loadSectorsTab();
         syncSectorTelegramToggle();
     }
     if (tab === 'ipos') { loadIposTab(); }
-    if (tab === 'market-direction') { loadMarketDirection(); }
+    if (tab === 'technofunda') { tfInit(); }
     if (tab === 'swing') { loadSignals('swing'); showVcpInfo(); }
     if (tab === 'fno') { loadFnoSignals(); loadSchedulerStatus(); switchFnoSubTab(fnoSubTab); }
     if (tab === 'index') { loadIndexSignals(); }
@@ -5185,9 +5404,10 @@ function renderVcpSignal(signal) {
 function startApp() {
     initTheme();
     initSidebar();
+    initTabOrder();
     loadPnlGuardStatus();
-    switchTab('sectors');
     applyRoleAccess();
+    switchTab(firstNavTab());
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -5396,3 +5616,1100 @@ function generateTokenNow() {
 function refreshDhanToken() {
     return _runTokenAction('btn-refresh-token', 'Renewing…', `${API_BASE}/api/settings/token/refresh`);
 }
+
+// ── TechnoFunda Analysis tab ──
+// Search an NSE stock → /api/techno-funda/analyze/{symbol} → structured report
+// (Summary · Fundamental · Technical · Business & News). Rendering only; all analysis is server-side.
+
+const TF_RECENT_KEY = 'tf-recent';
+const TF_VIEW_KEY = 'tf-view';
+let _tfReport = null;
+let _tfView = (() => { try { return localStorage.getItem(TF_VIEW_KEY) || 'summary'; } catch (_) { return 'summary'; } })();
+let _tfSuggest = [];
+let _tfActive = -1;
+let _tfSearchTimer = null;
+let _tfSearchSeq = 0;
+let _tfChart = null;
+let _tfInitDone = false;
+let _tfLoadingSymbol = null;
+
+const tfEsc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function tfNum(v, nd = 2) {
+    if (v === null || v === undefined || v === '' || Number.isNaN(Number(v))) return '—';
+    return Number(v).toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: nd });
+}
+function tfRs(v, nd = 2) { return v === null || v === undefined ? '—' : '₹' + tfNum(v, nd); }
+function tfPct(v, nd = 1, signed = false) {
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
+    const n = Number(v);
+    return (signed && n > 0 ? '+' : '') + n.toFixed(nd) + '%';
+}
+function tfCr(v) {
+    if (v === null || v === undefined) return '—';
+    const n = Number(v);
+    if (Math.abs(n) >= 100000) return '₹' + (n / 100000).toLocaleString('en-IN', { maximumFractionDigits: 2 }) + ' L Cr';
+    return '₹' + n.toLocaleString('en-IN', { maximumFractionDigits: 0 }) + ' Cr';
+}
+function tfTone(v) { return v === null || v === undefined ? '' : (Number(v) > 0 ? 'tf-pos' : Number(v) < 0 ? 'tf-neg' : ''); }
+function tfBandClass(score) {
+    if (score === null || score === undefined) return 'tf-band--na';
+    return score >= 75 ? 'tf-band--strong' : score >= 60 ? 'tf-band--pos' : score >= 45 ? 'tf-band--neutral' : score >= 30 ? 'tf-band--weak' : 'tf-band--poor';
+}
+
+// ── init / quota ──
+
+function tfInit() {
+    if (!_tfInitDone) {
+        _tfInitDone = true;
+        const input = document.getElementById('tf-search-input');
+        input.addEventListener('input', () => {
+            clearTimeout(_tfSearchTimer);
+            const q = input.value.trim();
+            if (!q) { tfHideSuggest(); return; }
+            _tfSearchTimer = setTimeout(() => tfSearch(q, false), 180);
+        });
+        input.addEventListener('keydown', tfSearchKeydown);
+        input.addEventListener('focus', () => { if (_tfSuggest.length && input.value.trim()) tfShowSuggest(); });
+        document.addEventListener('click', e => { if (!e.target.closest('#tf-search')) tfHideSuggest(); });
+        tfRenderRecent();
+        if (!_tfReport) tfRenderEmpty();
+    }
+    tfLoadQuota();
+    setTimeout(() => document.getElementById('tf-search-input')?.focus(), 30);
+}
+
+async function tfLoadQuota(q) {
+    try {
+        const data = q || await (await fetch(`${API_BASE}/api/techno-funda/quota`)).json();
+        const el = document.getElementById('tf-quota');
+        if (!el || !data) return;
+        el.classList.toggle('tf-quota--out', !!data.exhausted);
+        el.innerHTML = data.exhausted
+            ? '<span class="tf-dot"></span>Tapetide daily limit reached · cached fundamentals only'
+            : `<span class="tf-dot"></span>Tapetide: ${tfEsc(data.calls_by_this_tab)} of ${tfEsc(data.daily_limit)} daily calls used here`;
+    } catch (_) { /* non-critical */ }
+}
+
+// ── search ──
+
+async function tfSearch(q, deep) {
+    const seq = ++_tfSearchSeq;
+    try {
+        const resp = await fetch(`${API_BASE}/api/techno-funda/search?q=${encodeURIComponent(q)}${deep ? '&deep=true' : ''}`);
+        const data = await resp.json();
+        if (seq !== _tfSearchSeq) return;
+        _tfSuggest = data.results || [];
+        _tfActive = _tfSuggest.length ? 0 : -1;
+        tfRenderSuggest(q, deep);
+        if (deep) tfLoadQuota(data.quota);
+    } catch (e) {
+        if (seq === _tfSearchSeq) { _tfSuggest = []; tfRenderSuggest(q, deep, e.message); }
+    }
+}
+
+function tfRenderSuggest(q, deep, err) {
+    const box = document.getElementById('tf-suggest');
+    let html = '';
+    if (err) html += `<div class="tf-suggest-empty">Search failed: ${tfEsc(err)}</div>`;
+    _tfSuggest.forEach((r, i) => {
+        html += `<div class="tf-suggest-item${i === _tfActive ? ' active' : ''}" role="option" id="tf-opt-${i}" aria-selected="${i === _tfActive}"
+                    onmousedown="event.preventDefault(); tfPick(${i})" onmouseenter="tfSetActive(${i})">
+                    <span class="tf-sym">${r.symbol ? tfEsc(r.symbol) : '<span class="tf-muted" title="Ticker missing in the instrument list; it is looked up by ISIN">ISIN</span>'}</span>
+                    <span class="tf-name">${tfEsc(r.name)}</span>
+                    <span class="tf-tags">
+                        ${r.is_fno ? '<span class="tf-tag">F&amp;O</span>' : ''}
+                        ${r.exchange === 'BSE' ? '<span class="tf-tag">BSE</span>' : ''}
+                        ${r.cached ? '<span class="tf-tag tf-tag--ok" title="Fundamentals saved on this machine — opening it costs no Tapetide calls">saved</span>' : ''}
+                        ${r.sector ? `<span class="tf-sector">${tfEsc(r.sector)}</span>` : ''}
+                    </span>
+                 </div>`;
+    });
+    if (!_tfSuggest.length && !err) {
+        html += `<div class="tf-suggest-empty">No NSE symbol or name matches “${tfEsc(q)}”.</div>`;
+    }
+    if (!deep && q.length >= 2 && _tfSuggest.length < 3) {
+        html += `<button type="button" class="tf-suggest-deep" onmousedown="event.preventDefault(); tfSearch(${tfEsc(JSON.stringify(q))}, true)">
+                    Search brand / old names via Tapetide <span>uses 1 of 50 daily calls</span></button>`;
+    }
+    const missing = _tfSuggest.some(r => !r.symbol);
+    html += `<div class="tf-suggest-hint">↑ ↓ to move · Enter to analyse · Esc to close${missing ? ' · “ISIN” rows have no ticker yet: Settings → Refresh instruments fixes that' : ''}</div>`;
+    box.innerHTML = html;
+    tfShowSuggest();
+}
+
+function tfShowSuggest() {
+    const box = document.getElementById('tf-suggest');
+    box.hidden = false;
+    document.getElementById('tf-search-input').setAttribute('aria-expanded', 'true');
+}
+function tfHideSuggest() {
+    const box = document.getElementById('tf-suggest');
+    if (box) box.hidden = true;
+    document.getElementById('tf-search-input')?.setAttribute('aria-expanded', 'false');
+}
+function tfSetActive(i) {
+    _tfActive = i;
+    document.querySelectorAll('#tf-suggest .tf-suggest-item').forEach((el, j) => {
+        el.classList.toggle('active', j === i);
+        el.setAttribute('aria-selected', j === i);
+    });
+    document.getElementById(`tf-opt-${i}`)?.scrollIntoView({ block: 'nearest' });
+}
+
+function tfSearchKeydown(e) {
+    const box = document.getElementById('tf-suggest');
+    const open = box && !box.hidden;
+    if (e.key === 'ArrowDown' && _tfSuggest.length) { e.preventDefault(); tfShowSuggest(); tfSetActive(Math.min(_tfSuggest.length - 1, _tfActive + 1)); }
+    else if (e.key === 'ArrowUp' && _tfSuggest.length) { e.preventDefault(); tfSetActive(Math.max(0, _tfActive - 1)); }
+    else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (open && _tfActive >= 0 && _tfSuggest[_tfActive]) tfPick(_tfActive);
+        else tfAnalyzeFromInput();
+    } else if (e.key === 'Escape') tfHideSuggest();
+}
+
+function tfPick(i) {
+    const r = _tfSuggest[i];
+    if (!r) return;
+    document.getElementById('tf-search-input').value = r.symbol || r.name || r.key;
+    tfHideSuggest();
+    tfAnalyze(r.key || r.symbol);
+}
+
+function tfAnalyzeFromInput() {
+    const v = (document.getElementById('tf-search-input').value || '').trim();
+    if (!v) { document.getElementById('tf-search-input').focus(); return; }
+    // Exact symbol typed → go; otherwise use the top suggestion if we have one.
+    const exact = _tfSuggest.find(r => r.symbol === v.toUpperCase());
+    const sym = exact ? exact.symbol : (_tfSuggest[0] && !/^[A-Z0-9&\-]+$/.test(v) ? (_tfSuggest[0].key || _tfSuggest[0].symbol) : v.toUpperCase());
+    document.getElementById('tf-search-input').value = sym;
+    tfHideSuggest();
+    tfAnalyze(sym);
+}
+
+// ── recent ──
+
+function tfRecent() { try { return JSON.parse(localStorage.getItem(TF_RECENT_KEY) || '[]'); } catch (_) { return []; } }
+function tfPushRecent(sym, name) {
+    const list = tfRecent().filter(r => r.symbol !== sym);
+    list.unshift({ symbol: sym, name });
+    try { localStorage.setItem(TF_RECENT_KEY, JSON.stringify(list.slice(0, 8))); } catch (_) {}
+    tfRenderRecent();
+}
+function tfRenderRecent() {
+    const el = document.getElementById('tf-recent');
+    const list = tfRecent();
+    if (!el) return;
+    el.innerHTML = list.length
+        ? '<span class="tf-recent-label">Recent</span>' + list.map(r =>
+            `<button type="button" class="tf-chip" title="${tfEsc(r.name || r.symbol)}" onclick="tfAnalyze('${tfEsc(r.symbol)}')">${tfEsc(r.symbol)}</button>`).join('')
+        : '';
+}
+
+// ── analyse ──
+
+async function tfAnalyze(symbol, opts = {}) {
+    symbol = String(symbol || '').trim().toUpperCase();
+    if (!symbol || _tfLoadingSymbol === symbol) return;
+    _tfLoadingSymbol = symbol;
+    const report = document.getElementById('tf-report');
+    if (!opts.quiet) tfRenderLoading(symbol, opts);
+    const params = new URLSearchParams();
+    if (opts.refresh) params.set('refresh', 'true');
+    if (opts.refreshFundamentals) params.set('refresh_fundamentals', 'true');
+    try {
+        const resp = await fetch(`${API_BASE}/api/techno-funda/analyze/${encodeURIComponent(symbol)}?${params}`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+        _tfReport = data;
+        tfPushRecent(data.symbol, data.name);
+        tfRenderReport();
+        tfLoadQuota(data.quota);
+    } catch (e) {
+        report.innerHTML = `<div class="tf-card tf-error">
+            <h3>Could not analyse ${tfEsc(symbol)}</h3><p>${tfEsc(e.message)}</p>
+            <p class="tf-muted">Check the NSE symbol (e.g. <b>HDFCBANK</b>, <b>RELIANCE</b>) or pick a match from the search list.</p></div>`;
+    } finally {
+        _tfLoadingSymbol = null;
+    }
+}
+
+function tfRenderEmpty() {
+    document.getElementById('tf-report').innerHTML = `
+        <div class="tf-card tf-empty">
+            <div class="tf-empty-grid">
+                <div><h3>Fundamental engine</h3><p>Valuation vs its own history, PEG, earnings yield, analyst targets, a 12–20× fair-value band, a mini-DCF, growth (3/5/10Y and quarterly), ROE/ROCE, cash conversion, Piotroski, leverage, promoter and institutional holding, pledge, concall takeaways.</p></div>
+                <div><h3>Technical engine</h3><p>Trend (20–200 DMAs, Minervini template, Weinstein stage), momentum (RSI, MACD, ADX, stochastic), relative strength vs Nifty 50, volume (OBV, accumulation/distribution), volatility (ATR, Bollinger squeeze), support/resistance, pivots, Fibonacci and reference levels.</p></div>
+                <div><h3>Verdict</h3><p>Both engines score 0–100 and combine into one TechnoFunda score, a quadrant (e.g. “Quality in momentum”), the key positives and risks, and what would change the view.</p></div>
+            </div>
+            <p class="tf-muted">Data: statements, ratios and shareholding from Screener.in, pledge and scorecard from Tickertape, prices from Dhan (or Yahoo Finance), all free. Analyst estimates, the concall digest and news come from Tapetide (about 3 of its 50 free daily calls per new stock). Each stock is saved for 24 hours, so reopening it is instant.</p>
+        </div>`;
+}
+
+function tfRenderLoading(symbol, opts) {
+    document.getElementById('tf-report').innerHTML = `
+        <div class="tf-card tf-loading">
+            <div class="tf-spinner" aria-hidden="true"></div>
+            <div>
+                <h3>Analysing ${tfEsc(symbol)}…</h3>
+                <p class="tf-muted">${opts.refreshFundamentals ? 'Re-fetching fundamentals from Screener, Tickertape and Tapetide, and' : 'Loading saved or fresh fundamentals and'} two years of daily candles. This takes 5–20 seconds.</p>
+            </div>
+        </div>`;
+}
+
+function tfSetView(v) {
+    _tfView = v;
+    try { localStorage.setItem(TF_VIEW_KEY, v); } catch (_) {}
+    tfRenderReport();
+}
+
+function tfRenderReport() {
+    const d = _tfReport;
+    if (!d) return;
+    const views = [['summary', 'Summary'], ['fundamental', 'Fundamental'], ['technical', 'Technical'], ['business', 'Business & News']];
+    const body = { summary: tfViewSummary, fundamental: tfViewFundamental, technical: tfViewTechnical, business: tfViewBusiness }[_tfView] || tfViewSummary;
+    document.getElementById('tf-report').innerHTML = `
+        ${tfHero(d)}
+        <div class="tf-views" role="tablist">
+            ${views.map(([k, l]) => `<button type="button" role="tab" aria-selected="${_tfView === k}" class="tf-view${_tfView === k ? ' active' : ''}" onclick="tfSetView('${k}')">${l}</button>`).join('')}
+        </div>
+        <div class="tf-body">${body(d)}</div>
+        ${tfFooter(d)}`;
+    tfAttachInfo(document.getElementById('tf-report'));
+    if (_tfView === 'technical' || _tfView === 'summary') tfDrawChart(d);
+}
+
+// ── sections ──
+
+function tfHero(d) {
+    const f = d.fundamental || {}, t = d.technical || {}, c = f.company || {}, val = f.valuation || {};
+    const q = d.quote || {};
+    const lv = t.levels || {};
+    const lo = lv.low_52w, hi = lv.high_52w, px = d.price;
+    const pos = lo && hi && px && hi > lo ? Math.max(0, Math.min(100, (px - lo) / (hi - lo) * 100)) : null;
+    const meta = d.sources?.fundamentals_meta || {};
+    const fundAge = meta.source === 'cache' || meta.source === 'stale-cache'
+        ? `saved ${meta.age_hours != null ? (meta.age_hours < 1 ? 'under an hour' : Math.round(meta.age_hours) + 'h') : ''} ago`
+        : meta.source === 'live' ? `fetched now${meta.calls_used ? ` (${meta.calls_used} Tapetide calls)` : ''}` : 'unavailable';
+    const notes = [d.sources?.price_note, meta.message].filter(Boolean);
+    return `
+    <div class="tf-card tf-hero">
+        <div class="tf-hero-main">
+            <div class="tf-hero-id">
+                <h3><button type="button" class="tf-name-link" onclick="tfOpenInDhan('${tfEsc(d.symbol)}')"
+                        title="Open the TradingView chart on Dhan (copies ${tfEsc(d.symbol)} to paste into its symbol search)">
+                    ${tfEsc(d.name)}
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
+                </button></h3>
+                <div id="tf-dhan-msg" class="tf-dhan-msg" role="status" hidden></div>
+                <div class="tf-hero-tags">
+                    <span class="tf-tag tf-tag--strong">${tfEsc(d.symbol)}</span>
+                    ${c.classification ? `<span class="tf-tag">${tfEsc(c.classification)}</span>` : ''}
+                    ${c.is_fno ? '<span class="tf-tag">F&amp;O</span>' : ''}
+                    ${f.statement_basis ? `<span class="tf-tag" title="Financial statements basis">${tfEsc(f.statement_basis)}</span>` : ''}
+                    ${d.sector ? `<span class="tf-muted">${tfEsc(d.sector)}${d.industry && d.industry !== d.sector ? ' · ' + tfEsc(d.industry) : ''}</span>` : ''}
+                </div>
+            </div>
+            <div class="tf-hero-price">
+                <div class="tf-price">${tfRs(px)}</div>
+                ${q.change_pct != null ? `<div class="${tfTone(q.change_pct)}">${tfNum(q.change, 2)} (${tfPct(q.change_pct, 2, true)})</div>` : ''}
+            </div>
+        </div>
+        <div class="tf-hero-stats">
+            <div><span>Market cap</span><b>${tfCr(val.market_cap_cr)}</b></div>
+            <div><span>P/E (TTM)</span><b>${tfNum(val.pe, 1)}</b></div>
+            <div><span>P/B</span><b>${tfNum(val.pb, 2)}</b></div>
+            <div><span>ROE</span><b>${tfPct(f.quality?.roe)}</b></div>
+            <div><span>Div. yield</span><b>${tfPct(val.dividend_yield, 2)}</b></div>
+            <div class="tf-range"><span>52-week range</span>
+                ${pos !== null ? `<div class="tf-range-bar"><i style="left:${pos}%"></i></div><div class="tf-range-ends"><em>${tfRs(lo, 0)}</em><em>${tfRs(hi, 0)}</em></div>` : '<b>—</b>'}
+            </div>
+        </div>
+        <div class="tf-hero-foot">
+            <span class="tf-muted">Report ${tfEsc((d.generated_at || '').replace('T', ' '))}${d.cached ? ' (cached)' : ''} · Prices: ${tfEsc(d.sources?.prices)} · Fundamentals ${tfEsc(fundAge)}: ${tfEsc(d.sources?.fundamentals)}</span>
+            <span class="tf-hero-actions">
+                <button type="button" class="tf-btn" onclick="tfAnalyze('${tfEsc(d.symbol)}', {refresh: true})" title="Rebuild the report with fresh price data (no Tapetide calls if fundamentals are saved)">Refresh prices</button>
+                <button type="button" class="tf-btn" onclick="tfAnalyze('${tfEsc(d.symbol)}', {refresh: true, refreshFundamentals: true})" title="Re-download from Screener and Tickertape (free) plus Tapetide extras (about 3 of its 50 daily calls)">Re-fetch fundamentals</button>
+            </span>
+        </div>
+        ${notes.map(n => `<div class="tf-note">${tfEsc(n)}</div>`).join('')}
+    </div>`;
+}
+
+/** Same flow as the IPO tab: tv.dhan.co can't be deep-linked, so copy the ticker and open it. */
+async function tfOpenInDhan(sym) {
+    if (!sym) return;
+    const copy = navigator.clipboard?.writeText(sym).then(() => true, () => false) ?? Promise.resolve(false);
+    const ok = sxOpenTab(SX_DHAN_TV_URL);  // synchronous inside the click, so it isn't treated as a pop-up
+    const copied = await copy;
+    const el = document.getElementById('tf-dhan-msg');
+    if (!el) return;
+    el.hidden = false;
+    el.className = `tf-dhan-msg${ok ? '' : ' tf-dhan-msg--err'}`;
+    el.textContent = !ok ? 'Your browser blocked the new tab. Allow pop-ups for this site, then try again.'
+        : copied ? `Opened TradingView on Dhan · "${sym}" copied, paste it into the symbol search.`
+        : `Opened TradingView on Dhan · search for "${sym}".`;
+    clearTimeout(tfOpenInDhan._t);
+    tfOpenInDhan._t = setTimeout(() => { el.hidden = true; }, 8000);
+}
+
+function tfGauge(score, label, sub, big) {
+    const s = score ?? 0;
+    const r = big ? 46 : 34, cx = big ? 56 : 42, w = big ? 10 : 8, size = cx * 2;
+    const C = 2 * Math.PI * r;
+    return `<div class="tf-gauge ${big ? 'tf-gauge--big' : ''} ${tfBandClass(score)}">
+        <svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" aria-hidden="true">
+            <circle cx="${cx}" cy="${cx}" r="${r}" class="tf-gauge-track" stroke-width="${w}" fill="none"/>
+            <circle cx="${cx}" cy="${cx}" r="${r}" class="tf-gauge-val" stroke-width="${w}" fill="none"
+                stroke-dasharray="${(score == null ? 0 : s / 100 * C).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 ${cx} ${cx})" stroke-linecap="round"/>
+        </svg>
+        <div class="tf-gauge-text"><b>${score == null ? '—' : score}</b><span>${tfEsc(label)}</span></div>
+        ${sub ? `<div class="tf-gauge-sub">${tfEsc(sub)}</div>` : ''}
+    </div>`;
+}
+
+function tfPillars(title, pillars, weights, names) {
+    if (!pillars) return '';
+    return `<div class="tf-pillars"><h4>${tfEsc(title)}</h4>
+        ${Object.keys(names).map(k => {
+            const v = pillars[k];
+            return `<div class="tf-pillar ${tfBandClass(v)}">
+                <span class="tf-pillar-name">${tfEsc(names[k])}<em>${weights?.[k] ?? ''}%</em></span>
+                <span class="tf-bar"><i style="width:${v ?? 0}%"></i></span>
+                <b>${v ?? '—'}</b></div>`;
+        }).join('')}</div>`;
+}
+
+const TF_FUND_NAMES = { quality: 'Quality', growth: 'Growth', financial_health: 'Financial health', valuation: 'Valuation', ownership: 'Ownership' };
+const TF_TECH_NAMES = { trend: 'Trend', momentum: 'Momentum', relative_strength: 'Relative strength', volume: 'Volume', risk: 'Risk / volatility' };
+
+function tfViewSummary(d) {
+    const v = d.verdict || {}, f = d.fundamental || {}, t = d.technical || {};
+    return `
+    ${tfBusinessSummary(d)}
+    <div class="tf-card tf-verdict ${tfBandClass(v.score)}">
+        <div class="tf-verdict-gauges">
+            ${tfGauge(v.score, 'TechnoFunda', v.rating, true)}
+            <div class="tf-verdict-sub">
+                ${tfGauge(v.fundamental_score, 'Fundamental', v.fundamental_rating)}
+                ${tfGauge(v.technical_score, 'Technical', v.technical_bias || v.technical_rating)}
+            </div>
+        </div>
+        <div class="tf-verdict-text">
+            <div class="tf-quadrant">${tfEsc(v.quadrant)}</div>
+            <p>${tfEsc(v.summary)}</p>
+            <div class="tf-two">
+                <div><h4 class="tf-pos">Positives</h4><ul class="tf-list">${(v.positives || []).map(x => `<li>${tfEsc(x)}</li>`).join('') || '<li class="tf-muted">None stand out</li>'}</ul></div>
+                <div><h4 class="tf-neg">Risks / weaknesses</h4><ul class="tf-list">${(v.negatives || []).map(x => `<li>${tfEsc(x)}</li>`).join('') || '<li class="tf-muted">None flagged</li>'}</ul></div>
+            </div>
+            ${(v.triggers || []).length ? `<h4>What would change the view</h4><ul class="tf-list tf-list--plain">${v.triggers.map(x => `<li>${tfEsc(x)}</li>`).join('')}</ul>` : ''}
+            <p class="tf-muted tf-small">Weights: fundamental ${Math.round((v.weights?.fundamental || 0) * 100)}%, technical ${Math.round((v.weights?.technical || 0) * 100)}%.</p>
+        </div>
+    </div>
+    <div class="tf-grid-2">
+        <div class="tf-card">${f.available ? tfPillars('Fundamental pillars', f.pillars, f.weights, TF_FUND_NAMES) : tfUnavailable('Fundamentals', f.reason)}</div>
+        <div class="tf-card">${t.available ? tfPillars('Technical pillars', t.pillars, t.weights, TF_TECH_NAMES) : tfUnavailable('Technicals', t.reason)}</div>
+    </div>
+    ${t.available ? `<div class="tf-card"><h4>Price, 50-DMA and 200-DMA (1 year)</h4><div class="tf-chart"><canvas id="tf-chart"></canvas></div></div>` : ''}
+    ${f.available ? tfKeyMetrics(f) : ''}`;
+}
+
+function tfUnavailable(what, reason) {
+    return `<h4>${tfEsc(what)}</h4><p class="tf-muted">${tfEsc(reason || 'Not available for this stock.')}</p>`;
+}
+
+function tfMetricGrid(items) {
+    return `<div class="tf-metrics">${items.map(([label, value, hint, tone]) =>
+        `<div class="tf-metric" ${hint ? `title="${tfEsc(hint)}"` : ''}><span>${tfEsc(label)}</span><b class="${tone || ''}">${value}</b></div>`).join('')}</div>`;
+}
+
+function tfKeyMetrics(f) {
+    const v = f.valuation || {}, g = f.growth || {}, q = f.quality || {}, h = f.financial_health || {}, o = f.ownership || {};
+    return `<div class="tf-card"><h4>Key numbers</h4>${tfMetricGrid([
+        ['Sales CAGR 3Y', tfPct(g.sales_cagr?.['3 Years']), '', tfTone(g.sales_cagr?.['3 Years'])],
+        ['Profit CAGR 3Y', tfPct(g.profit_cagr?.['3 Years']), '', tfTone(g.profit_cagr?.['3 Years'])],
+        [`Sales YoY (${g.latest_quarter || 'latest Q'})`, tfPct(g.sales_yoy_q, 1, true), '', tfTone(g.sales_yoy_q)],
+        [`Profit YoY (${g.latest_quarter || 'latest Q'})`, tfPct(g.profit_yoy_q, 1, true), '', tfTone(g.profit_yoy_q)],
+        ['ROCE', tfPct(q.roce), '5Y average ' + tfPct(q.roce_5y_avg)],
+        ['Cash conversion (5Y)', q.cash_conversion_5y != null ? tfNum(q.cash_conversion_5y, 2) + '×' : '—', 'Operating cash flow ÷ net profit'],
+        ['Debt / Equity', h.is_financial ? 'n/a (lender)' : tfNum(h.debt_to_equity, 2)],
+        ['Promoter holding', tfPct(o.promoter), 'Pledged: ' + tfPct(o.pledge_pct)],
+        ['Forward P/E', tfNum(v.forward_pe, 1), v.forward_period ? 'FY ending ' + v.forward_period : ''],
+        ['Median P/E (own history)', tfNum(v.median_pe_hist, 1), v.median_pe_basis || ''],
+        ['PEG', tfNum(v.peg, 2), 'P/E ÷ EPS growth (3Y)'],
+        ['Analyst target', tfRs(v.analyst_target?.mean, 0), v.analyst_target?.upside_pct != null ? 'Upside ' + tfPct(v.analyst_target.upside_pct, 1, true) : ''],
+    ])}</div>`;
+}
+
+function tfChecklist(title, checks, score) {
+    if (!checks || !checks.length) return '';
+    const icon = { pass: '✓', fail: '✕', neutral: '–', na: '·' };
+    return `<div class="tf-card tf-checks">
+        <div class="tf-checks-head"><h4>${tfEsc(title)}</h4>${score != null ? `<span class="tf-score-pill ${tfBandClass(score)}">${score}/100</span>` : ''}</div>
+        <ul>${checks.map(c => `<li class="tf-check tf-check--${c.status}">
+            <span class="tf-check-icon" aria-label="${c.status}">${icon[c.status] || '·'}</span>
+            <span class="tf-check-label">${tfEsc(c.label)}</span>
+            <span class="tf-check-detail">${tfEsc(c.detail || '')}</span></li>`).join('')}</ul></div>`;
+}
+
+function tfTable(head, rows, cls = '') {
+    return `<div class="tf-table-wrap"><table class="tf-table ${cls}"><thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+        <tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+
+// ── Business: "what the company does" (Summary) and the deep dive (Fundamental) ──
+
+/** Minimal, safe Markdown → HTML for the annual-report digest: escapes first, then headings, lists, tables, bold. */
+function tfMd(md) {
+    const inline = t => tfEsc(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+    const out = [];
+    let list = null, table = null, para = [];
+    const flushPara = () => { if (para.length) { out.push(`<p>${inline(para.join(' '))}</p>`); para = []; } };
+    const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.map(i => `<li>${inline(i)}</li>`).join('')}</${list.tag}>`); list = null; } };
+    const flushTable = () => {
+        if (table) {
+            const rows = table.filter(r => !/^\s*\|?\s*:?-{2,}/.test(r)).map(r => r.replace(/^\s*\||\|\s*$/g, '').split('|').map(c => inline(c.trim())));
+            if (rows.length) out.push(`<div class="tf-table-wrap"><table class="tf-table tf-table--compact tf-table--wrap"><thead><tr>${rows[0].map(c => `<th>${c}</th>`).join('')}</tr></thead><tbody>${rows.slice(1).map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+            table = null;
+        }
+    };
+    for (const line of String(md || '').split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t) { flushPara(); flushList(); flushTable(); continue; }
+        if (t.startsWith('|')) { flushPara(); flushList(); (table = table || []).push(t); continue; }
+        flushTable();
+        let m;
+        if ((m = t.match(/^#{1,6}\s+(.*)/))) { flushPara(); flushList(); out.push(`<h6>${inline(m[1])}</h6>`); continue; }
+        if ((m = t.match(/^[-*•]\s+(.*)/)) || (m = t.match(/^\d+[.)]\s+(.*)/))) {
+            flushPara();
+            const tag = /^\d/.test(t) ? 'ol' : 'ul';
+            if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+            list.items.push(m[1]);
+            continue;
+        }
+        flushList();
+        para.push(t);
+    }
+    flushPara(); flushList(); flushTable();
+    return out.join('');
+}
+
+function tfMixBars(mix) {
+    if (!mix || !(mix.items || []).length) return '';
+    const max = Math.max(...mix.items.map(i => i.pct));
+    return `<div class="tf-mix">
+        ${mix.title ? `<div class="tf-mix-title">${tfEsc(mix.title)}</div>` : ''}
+        ${mix.items.map(i => `<div class="tf-mix-row"><span class="tf-mix-label">${tfEsc(i.label)}</span>
+            <span class="tf-bar"><i style="width:${(i.pct / max * 100).toFixed(1)}%"></i></span><b>${tfNum(i.pct, 1)}%</b></div>`).join('')}
+    </div>`;
+}
+
+function tfFactChips(facts, keys) {
+    const items = (keys || Object.keys(facts || {})).filter(k => facts && facts[k]);
+    if (!items.length) return '';
+    return `<div class="tf-facts">${items.map(k => `<span class="tf-fact"><em>${tfEsc(k)}</em>${k === 'Website'
+        ? `<a href="https://${tfEsc(String(facts[k]).replace(/^https?:\/\//, ''))}" target="_blank" rel="noopener noreferrer">${tfEsc(facts[k])}</a>`
+        : tfEsc(facts[k])}</span>`).join('')}</div>`;
+}
+
+function tfOpenDeepDive() {
+    tfSetView('fundamental');
+    requestAnimationFrame(() => document.getElementById('tf-deepdive')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+}
+
+function tfBusinessSummary(d) {
+    const b = d.business || {};
+    if (!b.available) return '';
+    const o = b.overview || {};
+    const name = (d.name || d.symbol || '').replace(/ (Ltd|Limited)\.?$/i, '');
+    return `
+    <div class="tf-card tf-biz">
+        <div class="tf-biz-head">
+            <h4>What ${tfEsc(name)} does</h4>
+            ${o.identity ? `<span class="tf-biz-identity">${tfEsc(o.identity)}</span>` : ''}
+        </div>
+        ${o.about ? `<p class="tf-biz-about">${tfEsc(o.about)}</p>` : ''}
+        ${o.latest ? `<div class="tf-biz-latest"><span class="tf-term-k">Where the business stands now${o.latest_period ? ` · annual report ${tfEsc(o.latest_period)}` : ''}</span><p>${tfEsc(o.latest)}</p></div>` : ''}
+        <div class="tf-biz-grid">
+            ${tfFactChips(b.facts, ['Founded', 'Headquarters', 'Industry', 'Employees', 'Listed since'])}
+            ${tfMixBars(b.revenue_mix)}
+        </div>
+        <button type="button" class="tf-btn tf-biz-more" onclick="tfOpenDeepDive()">Read the full business story →</button>
+    </div>`;
+}
+
+function tfBusinessDeepDive(d) {
+    const b = d.business || {};
+    if (!b.available) return '';
+    const o = b.overview || {}, ar = b.annual_report, peers = b.peers, wiki = b.wiki;
+    const name = (d.name || d.symbol || '').replace(/ (Ltd|Limited)\.?$/i, '');
+    const wikiParas = wiki?.extract ? wiki.extract.split(/\n+/).filter(Boolean).slice(0, 4) : [];
+    const story = (b.story || []).map(x => `<div class="tf-story-item"><h5>${tfEsc(x.title)}</h5><p>${tfEsc(x.text)}</p></div>`).join('');
+    const peerRows = (peers?.rows || []).map(r => [
+        `${r.is_self ? '<b>' : ''}${tfEsc(r.name)}${r.is_self ? '</b> <span class="tf-tag tf-tag--strong">this stock</span>' : ''}`,
+        tfRs(r.price), tfNum(r.pe, 1), tfCr(r.market_cap), tfPct(r.roce, 1),
+        `<span class="${tfTone(r.qtr_sales_var)}">${tfPct(r.qtr_sales_var, 1, true)}</span>`,
+        `<span class="${tfTone(r.qtr_profit_var)}">${tfPct(r.qtr_profit_var, 1, true)}</span>`]);
+    return `
+    <div id="tf-deepdive" class="tf-deep">
+        <div class="tf-deep-title"><h3>Business deep dive: ${tfEsc(name)}</h3>
+            <span class="tf-muted">What the company does, how it got here, and where it stands</span></div>
+
+        <div class="tf-grid-2">
+            <div class="tf-card"><h4>The business</h4>
+                ${o.identity ? `<div class="tf-biz-identity">${tfEsc(o.identity)}</div>` : ''}
+                ${o.about ? `<p class="tf-biz-about">${tfEsc(o.about)}</p>` : ''}
+                ${wikiParas.length ? `<div class="tf-wiki">${wikiParas.map(x => `<p>${tfEsc(x)}</p>`).join('')}
+                    <p class="tf-muted tf-small">Background from <a href="${tfEsc(wiki.url)}" target="_blank" rel="noopener noreferrer">Wikipedia</a> (CC BY-SA). Check recent filings for current details.</p></div>` : ''}
+                ${tfFactChips(b.facts)}
+            </div>
+            <div class="tf-card"><h4>Where the money comes from</h4>
+                ${tfMixBars(b.revenue_mix) || ''}
+                ${(b.key_points || []).length ? `<ul class="tf-list">${b.key_points.map(k => `<li>${tfEsc(k.replace(/^[-•]\s*/, ''))}</li>`).join('')}</ul>` : ''}
+                ${!b.revenue_mix && !(b.key_points || []).length ? `<p class="tf-muted">The company's segment split isn't published on the free sources; see “Segment” in the annual-report deep dive below.</p>` : ''}
+                <p class="tf-muted tf-small">Source: company disclosures via Screener.in.</p>
+            </div>
+        </div>
+
+        ${story ? `<div class="tf-card tf-story"><h4>The story in numbers</h4>
+            <p class="tf-muted tf-small">Written automatically from 10+ years of reported financials, peers and shareholding, not opinion.</p>${story}</div>` : ''}
+
+        ${ar ? `<div class="tf-card tf-ar"><h4>Annual report deep dive · ${tfEsc(ar.period || ar.title || '')}</h4>
+            <p class="tf-muted tf-small">An AI-generated digest (Tapetide) of the ${ar.pages ? tfEsc(ar.pages) + '-page ' : ''}annual report filed with the exchange. Verify key numbers against the
+                ${ar.pdf_url ? `<a href="${tfEsc(ar.pdf_url)}" target="_blank" rel="noopener noreferrer">original PDF</a>` : 'original filing'}.</p>
+            ${(ar.sections || []).map((sec, i) => `<details class="tf-ar-sec"${i < 2 ? ' open' : ''}><summary>${tfEsc(sec.heading)}</summary><div class="tf-md">${tfMd(sec.body)}</div></details>`).join('')}
+        </div>` : `<div class="tf-card"><h4>Annual report deep dive</h4><p class="tf-muted">No parsed annual report is available for this company yet${(d.quota || {}).exhausted ? ' (Tapetide’s daily limit is used up; it resets at midnight IST)' : ''}.</p></div>`}
+
+        ${peerRows.length ? `<div class="tf-card"><h4>Industry and peers</h4>
+            ${tfTable(['Company', 'Price', 'P/E', 'Market cap', 'ROCE', 'Sales YoY (qtr)', 'Profit YoY (qtr)'], peerRows, 'tf-table--compact tf-peers')}
+            <p class="tf-muted tf-small">Closest listed companies in the same industry group (Screener.in).</p></div>` : ''}
+    </div>`;
+}
+
+function tfViewFundamental(d) {
+    const f = d.fundamental || {};
+    if (!f.available) return `<div class="tf-card">${tfUnavailable('Fundamentals', f.reason)}</div>`;
+    const v = f.valuation || {}, g = f.growth || {}, q = f.quality || {}, h = f.financial_health || {}, o = f.ownership || {};
+    const fair = v.conservative_fair_range || {}, dcf = v.mini_dcf || {}, at = v.analyst_target || {};
+    const valuation = `<div class="tf-card"><h4>Valuation</h4>${tfMetricGrid([
+        ['P/E (TTM)', tfNum(v.pe, 1)], ['Median P/E, own history', tfNum(v.median_pe_hist, 1), v.median_pe_basis || ''],
+        ['Forward P/E', tfNum(v.forward_pe, 1)], ['PEG', tfNum(v.peg, 2)],
+        ['P/B', tfNum(v.pb, 2)], ['Earnings yield', tfPct(v.earnings_yield, 2), `vs 10Y G-sec ~${v.gsec_yield}%`],
+        ['EPS (TTM)', tfRs(v.eps_ttm)], ['Book value / share', tfRs(v.book_value)],
+        ['Graham number', tfRs(v.graham_number, 0), '√(22.5 × EPS × book value) — a deep-value ceiling'],
+        ['Value at own median P/E', tfRs(v.historical_pe_fair_value, 0), 'Forward (or TTM) EPS × median P/E: where it would trade if the old multiple returned'],
+        ['12–20× earnings band', fair.fair_value_low ? `${tfRs(fair.fair_value_low, 0)} – ${tfRs(fair.fair_value_high, 0)}` : '—', 'Value Investing tab’s conservative fair-value range'],
+        ['Mini-DCF (EPS based)', dcf.dcf_low ? `${tfRs(dcf.dcf_low, 0)} – ${tfRs(dcf.dcf_high, 0)}` : '—', dcf.growth_low != null ? `Growth ${dcf.growth_low}–${dcf.growth_high}%, Value Investing tab’s DCF settings` : ''],
+        ['Analyst target (mean)', tfRs(at.mean, 0), at.period ? 'Period ' + at.period : ''],
+        ['Analyst range', at.low ? `${tfRs(at.low, 0)} – ${tfRs(at.high, 0)}` : '—'],
+        ['Upside to mean target', tfPct(at.upside_pct, 1, true), '', tfTone(at.upside_pct)],
+    ])}</div>`;
+
+    const cagrRow = (label, obj, keys) => [label, ...keys.map(k => `<span class="${tfTone(obj?.[k])}">${tfPct(obj?.[k], 0)}</span>`)];
+    const growthCagr = tfTable(['', '3Y', '5Y', '10Y', 'TTM'], [
+        cagrRow('Sales', g.sales_cagr, ['3 Years', '5 Years', '10 Years', 'TTM']),
+        cagrRow('Net profit', g.profit_cagr, ['3 Years', '5 Years', '10 Years', 'TTM']),
+    ]);
+    const annual = (g.annual || []).length ? tfTable(['Year', 'Sales (Cr)', 'Net profit (Cr)', 'OPM %', 'EPS'],
+        g.annual.map(r => [tfEsc(r.period), tfNum(r.sales, 0), tfNum(r.net_profit, 0), tfNum(r.opm, 0), tfNum(r.eps, 2)])) : '';
+    const quarters = (g.quarters || []).length ? tfTable(['Quarter', 'Sales (Cr)', 'YoY', 'Net profit (Cr)', 'YoY', 'OPM %'],
+        g.quarters.map(r => [tfEsc(r.period), tfNum(r.sales, 0), `<span class="${tfTone(r.sales_yoy)}">${tfPct(r.sales_yoy, 1, true)}</span>`,
+            tfNum(r.net_profit, 0), `<span class="${tfTone(r.profit_yoy)}">${tfPct(r.profit_yoy, 1, true)}</span>`, tfNum(r.opm, 0)])) : '';
+
+    const pio = q.piotroski || {};
+    const quality = `<div class="tf-card"><h4>Profitability & quality</h4>${tfMetricGrid([
+        ['ROE (latest)', tfPct(q.roe)], ['ROE 3Y / 5Y / 10Y', [q.roe_history?.['3 Years'], q.roe_history?.['5 Years'], q.roe_history?.['10 Years']].map(x => tfPct(x, 0)).join(' / ')],
+        ['ROCE (latest)', tfPct(q.roce)], ['ROCE 5Y average', tfPct(q.roce_5y_avg)],
+        ['Cash conversion (5Y)', q.cash_conversion_5y != null ? tfNum(q.cash_conversion_5y, 2) + '×' : '—'],
+        ['FCF positive years', q.fcf_years ? `${q.fcf_positive_years} of ${q.fcf_years}` : '—'],
+        ['Other income % of PBT', tfPct(q.other_income_pct_pbt)], ['Debtor days', q.debtor_days != null ? tfNum(q.debtor_days, 0) + (q.debtor_days_change_3y != null ? ` (${q.debtor_days_change_3y > 0 ? '+' : ''}${tfNum(q.debtor_days_change_3y, 0)} in 3Y)` : '') : '—'],
+        ['Dividend payout', tfPct(q.dividend_payout_pct, 0)], ['Tax rate', tfPct(q.tax_rate_pct, 0)],
+    ])}
+    ${pio.available ? `<h5>Piotroski F-score: ${pio.score} / ${pio.max} <span class="tf-muted">(${tfEsc((pio.years || []).join(' → '))})</span></h5>
+        <ul class="tf-mini-checks">${pio.tests.map(t => `<li class="${t.passed ? 'tf-pos' : 'tf-neg'}">${t.passed ? '✓' : '✕'} ${tfEsc(t.label)}</li>`).join('')}</ul>` : ''}</div>`;
+
+    const health = `<div class="tf-card"><h4>Balance sheet</h4>${tfMetricGrid([
+        ['Debt / Equity', h.is_financial ? 'n/a (lender)' : tfNum(h.debt_to_equity, 2)],
+        ['Borrowings', tfCr(h.borrowings)], ['Net worth', tfCr(h.net_worth)],
+        ['Interest coverage', h.interest_coverage != null ? tfNum(h.interest_coverage, 1) + '×' : '—'],
+        ['Borrowings CAGR 3Y', tfPct(h.borrowings_cagr_3y)], ['Share capital change 3Y', tfPct(h.equity_change_3y_pct, 1, true)],
+    ])}</div>`;
+
+    const ownRows = Object.entries(o.table || {}).map(([k, arr]) => [tfEsc(k), ...arr.map(x => tfPct(x, 2))]);
+    const ownership = `<div class="tf-card"><h4>Shareholding</h4>
+        ${ownRows.length ? tfTable(['', ...(o.periods || []).map(tfEsc)], ownRows, 'tf-table--compact') : ''}
+        ${tfMetricGrid([
+            ['Promoter change (QoQ)', tfPct(o.promoter_change_qoq, 2, true), '', tfTone(o.promoter_change_qoq)],
+            ['Promoter change (1Y)', tfPct(o.promoter_change_1y, 2, true), '', tfTone(o.promoter_change_1y)],
+            ['FII + DII', tfPct(o.institutional, 2)], ['Institutional change (1Y)', tfPct(o.institutional_change_1y, 2, true), '', tfTone(o.institutional_change_1y)],
+            ['Promoter pledge', tfPct(o.pledge_pct, 2)], ['Shareholders (1Y change)', tfPct(o.shareholders_change_1y_pct, 1, true)],
+        ])}
+        ${(o.recent_deals || []).length ? `<h5>Recent bulk / block / insider deals</h5>${tfTable(['Date', 'Type', 'Side', 'Entity', 'Qty', 'Price'],
+            o.recent_deals.map(x => [tfEsc(x.date), tfEsc(x.kind), `<span class="${x.side === 'Buy' ? 'tf-pos' : 'tf-neg'}">${tfEsc(x.side)}</span>`, tfEsc(x.entity), tfNum(x.qty, 0), tfRs(x.price)]), 'tf-table--compact')}` : ''}
+    </div>`;
+
+    const flags = `<div class="tf-grid-2">
+        <div class="tf-card"><h4 class="tf-pos">Green flags</h4><ul class="tf-list">${(f.green_flags || []).map(x => `<li>${tfEsc(x)}</li>`).join('') || '<li class="tf-muted">None</li>'}</ul></div>
+        <div class="tf-card"><h4 class="tf-neg">Red flags</h4><ul class="tf-list">${(f.red_flags || []).map(x => `<li>${tfEsc(x)}</li>`).join('') || '<li class="tf-muted">None</li>'}</ul></div></div>`;
+
+    const P = f.pillars || {}, C = f.checks || {};
+    return `${tfBusinessDeepDive(d)}
+        ${flags}
+        <div class="tf-grid-2">
+            ${tfChecklist('Quality checks', C.quality, P.quality)}
+            ${tfChecklist('Growth checks', C.growth, P.growth)}
+            ${tfChecklist('Financial health checks', C.financial_health, P.financial_health)}
+            ${tfChecklist('Valuation checks', C.valuation, P.valuation)}
+            ${tfChecklist('Ownership checks', C.ownership, P.ownership)}
+        </div>
+        ${valuation}
+        <div class="tf-card"><h4>Growth</h4>${growthCagr}${annual ? '<h5>Annual</h5>' + annual : ''}${quarters ? '<h5>Last 8 quarters</h5>' + quarters : ''}</div>
+        <div class="tf-grid-2">${quality}${health}</div>
+        ${ownership}`;
+}
+
+function tfViewTechnical(d) {
+    const t = d.technical || {};
+    if (!t.available) return `<div class="tf-card">${tfUnavailable('Technicals', t.reason || d.sources?.price_note)}</div>`;
+    const tr = t.trend || {}, m = t.momentum || {}, rs = t.relative_strength || {}, vo = t.volume || {}, vl = t.volatility || {}, lv = t.levels || {}, p = t.plan || {};
+    const P = t.pillars || {}, C = t.checks || {};
+    const maRows = (tr.moving_averages || []).map(x => [tfEsc(x.name), tfRs(x.value), `<span class="${x.above ? 'tf-pos' : 'tf-neg'}">${tfPct(x.distance_pct, 1, true)}</span>`, x.above ? 'Above' : 'Below']);
+    const tt = tr.trend_template || {};
+    const retKeys = ['1W', '1M', '3M', '6M', '1Y'];
+    const retRows = [['Stock', ...retKeys.map(k => `<span class="${tfTone(m.returns?.[k])}">${tfPct(m.returns?.[k], 1, true)}</span>`)]];
+    if (rs.available) {
+        retRows.push(['Nifty 50', '—', ...['1M', '3M', '6M', '1Y'].map(k => tfPct(rs.benchmark_returns?.[k], 1, true))]);
+        retRows.push(['Out / under-performance', '—', ...['1M', '3M', '6M', '1Y'].map(k => `<span class="${tfTone(rs.outperformance?.[k])}">${rs.outperformance?.[k] != null ? (rs.outperformance[k] > 0 ? '+' : '') + tfNum(rs.outperformance[k], 1) + ' pts' : '—'}</span>`)]);
+    }
+    const lvlRows = [
+        ...(lv.resistances || []).slice().reverse().map(r => ['<span class="tf-neg">Resistance</span>', tfRs(r.price), tfPct(r.distance_pct, 1, true), `${r.touches}×`]),
+        [`<b>Last close</b>`, `<b>${tfRs(t.last_close)}</b>`, '', ''],
+        ...(lv.supports || []).map(s => ['<span class="tf-pos">Support</span>', tfRs(s.price), tfPct(s.distance_pct, 1, true), `${s.touches}×`]),
+    ];
+    const piv = lv.weekly_pivots || {};
+    return `
+    <div class="tf-card"><h4>Price, 50-DMA and 200-DMA (1 year)</h4><div class="tf-chart"><canvas id="tf-chart"></canvas></div>
+        <p class="tf-muted tf-small">As of ${tfEsc(t.as_of)} · ${tfEsc(t.sessions)} sessions · ${tfEsc(d.sources?.prices)}</p></div>
+    <div class="tf-grid-2">
+        ${tfChecklist('Trend checks', C.trend, P.trend)}
+        ${tfChecklist('Momentum checks', C.momentum, P.momentum)}
+        ${tfChecklist('Relative strength vs Nifty 50', C.relative_strength, P.relative_strength)}
+        ${tfChecklist('Volume checks', C.volume, P.volume)}
+        ${tfChecklist('Risk & volatility checks', C.risk, P.risk)}
+        ${tt.total ? tfChecklist(`Minervini trend template — ${tt.passed}/${tt.total}`, tt.checks, null) : ''}
+    </div>
+    <div class="tf-grid-2">
+        <div class="tf-card"><h4>Trend structure</h4>
+            ${tfMetricGrid([
+                ['Weinstein stage', tfEsc(tr.stage?.label || '—'), tr.stage?.wma30 ? `30-week MA ${tfRs(tr.stage.wma30)}, 4-week slope ${tfPct(tr.stage.wma30_slope_4w_pct, 2, true)}` : ''],
+                ['Weekly trend (10-week MA)', tfEsc(tr.weekly_trend || '—')],
+                ['200-DMA slope (1M)', tfPct(tr.sma200_slope_1m_pct, 2, true), '', tfTone(tr.sma200_slope_1m_pct)],
+                ['Last 50/200 cross', tr.last_cross ? `${tr.last_cross.type === 'golden' ? '<span class="tf-pos">Golden</span>' : '<span class="tf-neg">Death</span>'} · ${tfEsc(tr.last_cross.date)}` : '—', tr.last_cross ? tr.last_cross.sessions_ago + ' sessions ago' : ''],
+            ])}
+            ${tfTable(['Average', 'Value', 'Price vs MA', ''], maRows, 'tf-table--compact')}
+        </div>
+        <div class="tf-card"><h4>Momentum</h4>
+            ${tfMetricGrid([
+                ['RSI (14)', tfNum(m.rsi14, 1)], ['MACD / signal', `${tfNum(m.macd, 2)} / ${tfNum(m.macd_signal, 2)}`, 'Histogram ' + tfNum(m.macd_hist, 2)],
+                ['ADX (14)', tfNum(m.adx14, 1), `+DI ${tfNum(m.plus_di, 1)} / −DI ${tfNum(m.minus_di, 1)}`], ['Stochastic %K / %D', `${tfNum(m.stoch_k, 0)} / ${tfNum(m.stoch_d, 0)}`],
+                ['Mansfield RS', tfNum(rs.mansfield_rs, 1), 'Stock/Nifty ratio vs its 52-week average'], ['RS line trend (1M)', tfPct(rs.rs_line_trend_1m_pct, 2, true), '', tfTone(rs.rs_line_trend_1m_pct)],
+            ])}
+            <h5>Returns</h5>${tfTable(['', ...retKeys], retRows, 'tf-table--compact')}
+        </div>
+    </div>
+    <div class="tf-grid-2">
+        <div class="tf-card"><h4>Volume & volatility</h4>${tfMetricGrid([
+            ['Relative volume (today ÷ 20D)', vo.relative_volume != null ? tfNum(vo.relative_volume, 2) + '×' : '—'],
+            ['Avg volume 20D / 50D', `${tfNum(vo.avg20, 0)} / ${tfNum(vo.avg50, 0)}`],
+            ['Accumulation / distribution days (25)', `${vo.accumulation_days ?? '—'} / ${vo.distribution_days ?? '—'}`],
+            ['Up/down volume ratio (50D)', tfNum(vo.up_down_ratio_50d, 2)],
+            ['ATR (14)', `${tfRs(vl.atr14)} (${tfPct(vl.atr_pct, 2)})`], ['Historical volatility (20D, annualised)', tfPct(vl.hv20_annualised_pct, 1)],
+            ['Bollinger %B', tfNum(vl.bb_pct_b, 2), `Bands ${tfRs(vl.bb_lower)} – ${tfRs(vl.bb_upper)}`],
+            ['Band width', `${tfPct(vl.bb_width_pct, 1)}${vl.squeeze ? ' · squeeze' : ''}`, 'Squeeze = band width in its lowest 20% of the last 6 months'],
+            ['Max drawdown (1Y)', tfPct(vl.max_drawdown_1y_pct, 1), '', 'tf-neg'],
+        ])}</div>
+        <div class="tf-card"><h4>Key levels</h4>
+            ${tfTable(['', 'Price', 'Distance', 'Touches'], lvlRows, 'tf-table--compact')}
+            ${tfMetricGrid([
+                ['52-week high', `${tfRs(lv.high_52w)} (${tfPct(lv.from_52w_high_pct, 1, true)})`],
+                ['52-week low', `${tfRs(lv.low_52w)} (${tfPct(lv.from_52w_low_pct, 1, true)})`],
+                ['Weekly pivot', tfRs(piv.pivot), `R1 ${tfRs(piv.r1)} · R2 ${tfRs(piv.r2)} · S1 ${tfRs(piv.s1)} · S2 ${tfRs(piv.s2)}`],
+            ])}
+            ${lv.fibonacci_52w && Object.keys(lv.fibonacci_52w).length ? `<h5>Fibonacci retracements of the 52-week range</h5>
+                <div class="tf-fib">${Object.entries(lv.fibonacci_52w).map(([k, v]) => `<span><em>${tfEsc(k)}</em>${tfRs(v, 0)}</span>`).join('')}</div>` : ''}
+        </div>
+    </div>
+    ${p.available ? `<div class="tf-card tf-plan"><h4>Reference levels <span class="tf-muted">(educational, not a trade recommendation)</span></h4>
+        <div class="tf-plan-grid">
+            <div><span>Entry zone</span><b>${tfRs(p.entry_zone?.[0])} – ${tfRs(p.entry_zone?.[1])}</b></div>
+            <div class="tf-neg-bg"><span>Stop-loss (${tfEsc(p.stop_basis)})</span><b>${tfRs(p.stop_loss)}</b><em>Risk ${tfRs(p.risk_per_share)} / share (${tfPct(p.risk_pct, 1)})</em></div>
+            <div class="tf-pos-bg"><span>Target 1</span><b>${tfRs(p.target_1)}</b><em>${tfNum(p.target_1_rr, 1)} R</em></div>
+            <div class="tf-pos-bg"><span>Target 2</span><b>${tfRs(p.target_2)}</b><em>${tfNum(p.target_2_rr, 1)} R</em></div>
+        </div>
+        <p class="tf-muted tf-small">Stop = the tighter of 2 × ATR and just below the nearest support (never closer than 1 × ATR). Targets = next resistances, or 2R / 3R when none are close.</p>
+    </div>` : ''}`;
+}
+
+function tfViewBusiness(d) {
+    const f = d.fundamental || {}, c = f.company || {}, cc = f.concall, ts = f.tapetide_score, op = f.options;
+    const sentiment = s => s ? `<span class="tf-tag ${s === 'positive' ? 'tf-tag--ok' : s === 'negative' ? 'tf-tag--bad' : ''}">${tfEsc(s)}</span>` : '';
+    return `
+    <div class="tf-card"><h4>About ${tfEsc(c.name || d.name)}</h4>
+        <p class="tf-about">${tfEsc(c.about || 'No description available.')}</p>
+        ${tfMetricGrid([
+            ['Sector path', tfEsc([c.sector, c.industry, c.basic_industry].filter(Boolean).join(' › ') || '—')],
+            ['Listed since', tfEsc(c.listing_date || '—')], ['CEO', tfEsc(c.ceo || '—')],
+            ['Employees', tfNum(c.employees, 0)], ['Website', c.website ? `<a href="https://${tfEsc(c.website)}" target="_blank" rel="noopener noreferrer">${tfEsc(c.website)}</a>` : '—'],
+            ['ISIN', tfEsc(d.isin || '—')],
+        ])}
+        ${(c.pros || []).length || (c.cons || []).length ? `<div class="tf-two">
+            <div><h5 class="tf-pos">Pros (Tapetide)</h5><ul class="tf-list">${(c.pros || []).map(x => `<li>${tfEsc(x)}</li>`).join('')}</ul></div>
+            <div><h5 class="tf-neg">Cons (Tapetide)</h5><ul class="tf-list">${(c.cons || []).map(x => `<li>${tfEsc(x)}</li>`).join('')}</ul></div></div>` : ''}
+    </div>
+    ${cc ? `<div class="tf-card"><h4>Latest earnings call — ${tfEsc(cc.period || '')}</h4>
+        <div class="tf-three">
+            <div><h5 class="tf-pos">Highlights</h5><ul class="tf-list">${cc.highlights.map(x => `<li>${tfEsc(x)}</li>`).join('')}</ul></div>
+            <div><h5 class="tf-neg">Risks</h5><ul class="tf-list">${cc.risks.map(x => `<li>${tfEsc(x)}</li>`).join('')}</ul></div>
+            <div><h5>Guidance</h5><ul class="tf-list">${cc.guidance.map(x => `<li>${tfEsc(x)}</li>`).join('')}</ul></div>
+        </div><p class="tf-muted tf-small">AI-generated digest of the concall transcript (Tapetide).</p></div>` : ''}
+    ${(f.news || []).length ? `<div class="tf-card"><h4>Recent news</h4><ul class="tf-news">${f.news.map(n => `<li>
+        <div class="tf-news-head"><b>${n.url ? `<a href="${tfEsc(n.url)}" target="_blank" rel="noopener noreferrer">${tfEsc(n.title)}</a>` : tfEsc(n.title)}</b>${sentiment(n.sentiment)}<span class="tf-muted">${tfEsc(n.date)}</span></div>
+        ${n.summary ? `<p class="tf-muted">${tfEsc(n.summary)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
+    <div class="tf-grid-2">
+        ${(f.corporate_actions || []).length ? `<div class="tf-card"><h4>Corporate actions</h4>${tfTable(['Ex-date', 'Type', 'Detail'],
+            f.corporate_actions.map(a => [tfEsc(a.ex_date), tfEsc([a.type, a.kind].filter(Boolean).join(' · ')), tfEsc(a.detail)]), 'tf-table--compact')}</div>` : ''}
+        ${op ? `<div class="tf-card"><h4>Options market (nearest liquid expiry)</h4>${tfMetricGrid([
+            ['Expiry', tfEsc(op.expiry || '—')], ['ATM implied vol', tfPct(op.atm_iv, 1)],
+            ['IV rank / percentile', `${tfNum(op.iv_rank, 0)} / ${tfNum(op.iv_percentile, 0)}`], ['Put-call ratio (OI)', tfNum(op.pcr_oi, 2)],
+            ['Max pain', tfRs(op.max_pain, 0)],
+        ])}</div>` : ''}
+        ${(f.tickertape_scorecard || []).length ? `<div class="tf-card"><h4>Tickertape scorecard (independent cross-check)</h4>
+            ${tfTable(['', 'Rating', 'What it means'], f.tickertape_scorecard.map(x => [tfEsc(x.name), `<b>${tfEsc(x.tag)}</b>`, tfEsc(x.description)]), 'tf-table--compact tf-table--wrap')}</div>` : ''}
+        ${ts ? `<div class="tf-card"><h4>Tapetide score (independent cross-check)</h4>
+            ${tfMetricGrid([['Score', `${tfNum(ts.score, 0)} / 100`], ['Percentile', tfNum(ts.percentile, 1)], ['Data confidence', tfPct(ts.confidence, 0)]])}
+            ${ts.pillars ? tfTable(['Pillar', 'Score'], Object.entries(ts.pillars).map(([k, v]) => [tfEsc(k.replace(/_/g, ' ')), tfNum(v, 0)]), 'tf-table--compact') : ''}</div>` : ''}
+        ${(f.credit_ratings || []).length ? `<div class="tf-card"><h4>Credit ratings</h4>${tfTable(['Date', 'Agency', 'Rating', 'Action', 'Outlook'],
+            f.credit_ratings.map(r => [tfEsc(r.date), tfEsc(r.agency), tfEsc(r.rating), tfEsc(r.action), tfEsc(r.outlook)]), 'tf-table--compact')}</div>` : ''}
+    </div>
+    ${!cc && !(f.news || []).length ? `<p class="tf-muted tf-small">The concall digest and news come from Tapetide (1 call each). They appear once its daily limit resets, or when enabled in <code>techno_funda.tapetide_extras</code> in config.yaml.</p>` : ''}`;
+}
+
+function tfFooter(d) {
+    return `<div class="tf-footer">
+        <p><b>Sources:</b> ${tfEsc(d.sources?.prices)}; ${tfEsc(d.sources?.fundamentals)}. Analysis took ${tfEsc(d.elapsed_sec)}s.</p>
+        <p class="tf-disclaimer">${tfEsc(d.disclaimer)}</p></div>`;
+}
+
+// ── chart ──
+
+function tfDrawChart(d) {
+    const canvas = document.getElementById('tf-chart');
+    const ch = d.technical?.chart;
+    if (_tfChart) { _tfChart.destroy(); _tfChart = null; }
+    if (!canvas || !ch || typeof Chart === 'undefined') return;
+    const css = getComputedStyle(document.documentElement);
+    const grid = css.getPropertyValue('--chart-grid').trim() || 'rgba(128,128,128,0.1)';
+    const label = css.getPropertyValue('--chart-label').trim() || '#64748b';
+    const accent = css.getPropertyValue('--accent').trim() || '#6366f1';
+    _tfChart = new Chart(canvas.getContext('2d'), {
+        data: {
+            labels: ch.dates,
+            datasets: [
+                { type: 'line', label: 'Close', data: ch.close, borderColor: accent, borderWidth: 1.8, pointRadius: 0, tension: 0.1, yAxisID: 'y', order: 1 },
+                { type: 'line', label: '50-DMA', data: ch.sma50, borderColor: '#f59e0b', borderWidth: 1.3, pointRadius: 0, borderDash: [4, 3], yAxisID: 'y', order: 2 },
+                { type: 'line', label: '200-DMA', data: ch.sma200, borderColor: '#ef4444', borderWidth: 1.3, pointRadius: 0, borderDash: [6, 4], yAxisID: 'y', order: 3 },
+                { type: 'bar', label: 'Volume', data: ch.volume, backgroundColor: 'rgba(148,163,184,0.25)', yAxisID: 'v', order: 4 },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false, animation: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { labels: { color: label, boxWidth: 14, font: { size: 10 } } },
+                tooltip: { callbacks: { label: c => c.dataset.label === 'Volume' ? `Volume: ${tfNum(c.raw, 0)}` : `${c.dataset.label}: ₹${tfNum(c.raw, 2)}` } },
+            },
+            scales: {
+                x: { ticks: { color: label, maxTicksLimit: 8, font: { size: 10 } }, grid: { color: grid } },
+                y: { position: 'right', ticks: { color: label, font: { size: 10 } }, grid: { color: grid } },
+                v: { position: 'left', display: false, beginAtZero: true, max: Math.max(...ch.volume.filter(Boolean)) * 4 || undefined },
+            },
+        },
+    });
+}
+
+// ── TechnoFunda glossary: ⓘ buttons that explain every term in plain language ──
+// Each entry: t = title, w = what it is, r = how to read it, e = worked example.
+// Buttons are attached after each render by matching label text (tfTermKey), so labels that
+// come from the backend (check names) are covered without wiring every call site.
+
+const TF_GLOSSARY = {
+    // ── Scores & verdict ──
+    technofunda: { t: 'TechnoFunda score', w: 'One 0–100 number that blends how good the business is (fundamental score, 55%) with how healthy the price trend is (technical score, 45%).', r: '75+ Strong · 60–74 Positive · 45–59 Neutral · 30–44 Weak · below 30 Poor. It summarises the checklists below; it is not a buy or sell signal on its own.', e: 'Fundamental 72 and technical 58 give 0.55 × 72 + 0.45 × 58 ≈ 66, "Positive".' },
+    fundamental_score: { t: 'Fundamental score', w: 'How strong the business and its financials are, from 0 to 100. It averages five pillars: quality, growth, financial health, valuation and ownership.', r: 'Higher is better. It is capped when promoters have pledged a lot of their shares, and pulled toward 50 when too little data was available to judge.', e: 'A debt-free company with 25% ROE, steady growth and a fair P/E typically scores 70+.' },
+    technical_score: { t: 'Technical score', w: 'How healthy the price chart is, from 0 to 100. It averages five pillars: trend, momentum, relative strength, volume and risk.', r: 'High = the stock is in an established uptrend with buyers in control. Low = downtrend or weak price action. It says nothing about whether the business is good.', e: 'A stock above its rising 200-day average, beating the Nifty, on rising volume usually scores 70+.' },
+    quadrant: { t: 'Techno-funda quadrant', w: 'A plain-language label that combines the two scores: is the business good, and is the chart supportive?', r: '"Quality in momentum" = both strong. "Good business, weak chart" = wait for the trend to turn. "Momentum without fundamental support" = a trade at best, not an investment. "Weak on both counts" = no edge.', e: 'Fundamental 72 + technical 40 → "Good business, weak chart".' },
+    confidence: { t: 'Data confidence', w: 'How many of the checks could actually be run with the data available.', r: 'When few checks ran (new listings, tiny companies, missing filings), the score is pulled toward a neutral 50 so a handful of passes cannot make a stock look great.', e: 'Only 6 of ~25 checks had data → a raw 85 is shown as about 64.' },
+    governance: { t: 'Governance cap', w: 'A ceiling on the fundamental score when promoters have pledged a large part of their shares as loan collateral.', r: '≥ 50% of the promoter stake pledged caps the score at 50; ≥ 20% caps it at 65. A falling price can force lenders to sell pledged shares, which pushes the price down further.', e: 'Promoters own 55%, and all of it is pledged → the score cannot exceed 50, however good the profits are.' },
+    // pillars
+    p_quality: { t: 'Quality pillar', w: 'Does the company earn high returns on the money it uses, and are its profits real cash?', r: 'Built from ROE, ROCE, cash conversion, free cash flow, other income, debtor days and the Piotroski score.', e: 'ROCE 30% and operating cash flow matching profit → high quality.' },
+    p_growth: { t: 'Growth pillar', w: 'Are sales and profits growing, both over years and in the latest quarter?', r: 'Built from 3/5-year sales and profit CAGR, the latest quarter vs a year ago, margin trend and EPS growth.', e: 'Sales +15% a year for 3 years and the last quarter’s profit +20% YoY → strong growth.' },
+    p_health: { t: 'Financial health pillar', w: 'Can the company comfortably carry its debt?', r: 'Built from debt/equity, interest coverage, whether debt grows faster than sales, net worth and share dilution. Banks and NBFCs are judged on net-worth growth and ROE instead, because borrowing is their business.', e: 'Debt/equity 0.2 and interest covered 15× → very healthy.' },
+    p_valuation: { t: 'Valuation pillar', w: 'Is the price reasonable for what you get?', r: 'Built from P/E vs its own history, PEG, earnings yield vs government bonds and the analyst target. A great business can still be a poor buy at too high a price.', e: 'P/E 18 when it usually trades at 25 → attractive on valuation.' },
+    p_ownership: { t: 'Ownership pillar', w: 'Who owns the company, and are insiders and institutions buying or selling?', r: 'Built from promoter holding, promoter selling, pledged shares, and whether FIIs/DIIs are adding.', e: 'Promoters hold 60%, none pledged, mutual funds raising their stake → strong ownership.' },
+    p_trend: { t: 'Trend pillar', w: 'Is the stock in a sustained uptrend?', r: 'Built from price vs the 20/50/200-day averages, the slope of the 200-day average, the Minervini template and the Weinstein stage.', e: 'Price above a rising 200-DMA with the 50-DMA above it → strong trend.' },
+    p_momentum: { t: 'Momentum pillar', w: 'Is the recent move gaining or losing strength?', r: 'Built from RSI, MACD, ADX and the 3-month return.', e: 'RSI 62, MACD above its signal line, ADX 30 → good momentum.' },
+    p_rs: { t: 'Relative strength pillar', w: 'Is the stock doing better than the overall market (Nifty 50)?', r: 'Market leaders usually keep leading. Built from 3/6/12-month out-performance and the Mansfield RS.', e: 'Stock +25% in 6 months while the Nifty is +8% → strong relative strength.' },
+    p_volume: { t: 'Volume pillar', w: 'Is trading volume confirming the price move?', r: 'Big players leave footprints in volume. Rising prices on rising volume = accumulation; falling prices on rising volume = distribution.', e: '15 accumulation days vs 6 distribution days in a month → buyers in control.' },
+    p_risk: { t: 'Risk / volatility pillar', w: 'How wild are the price swings, and is the stock over-stretched?', r: 'Built from ATR %, distance above the 50-DMA, Bollinger Bands and the worst fall in the last year.', e: 'Daily range 1.5% of price and only 5% above the 50-DMA → calm, not over-extended.' },
+
+    // ── Valuation ──
+    market_cap: { t: 'Market capitalisation', w: 'The total value the stock market puts on the company: share price × number of shares.', r: 'In India: large cap ≈ top 100 companies, mid cap 101–250, small cap the rest. Bigger usually means more stable but slower-growing.', e: '1,000 crore shares × ₹500 = ₹5,00,000 crore market cap.' },
+    pe: { t: 'P/E ratio (price to earnings)', w: 'How many rupees investors pay for every ₹1 of yearly profit per share. TTM = the last 12 months.', r: 'Lower = cheaper, but compare with the company’s own history and peers. Fast growers deserve higher P/Es; a very low P/E can mean the market expects trouble.', e: 'Price ₹500, EPS ₹25 → P/E 20: you pay ₹20 for each ₹1 of annual profit.' },
+    forward_pe: { t: 'Forward P/E', w: 'Price divided by next year’s expected EPS (analyst consensus), instead of last year’s.', r: 'Forward P/E below the current P/E means analysts expect profits to grow.', e: 'Price ₹500, expected EPS ₹32 → forward P/E 15.6, vs 20 on last year’s earnings.' },
+    median_pe: { t: 'Median P/E (own history)', w: 'The P/E the stock has typically traded at over the past few years.', r: 'Today’s P/E well below its own median can mean it is cheap, or that the business has changed. Above the median = the market is paying more than usual.', e: 'Usually traded at 25× earnings, now at 17× → 32% below its normal valuation.' },
+    peg: { t: 'PEG ratio', w: 'P/E divided by the yearly earnings growth rate. It adjusts the P/E for growth.', r: 'Below 1 = cheap for its growth · 1–1.5 fair · above 2 expensive for its growth.', e: 'P/E 30 with EPS growing 30% a year → PEG 1.0. P/E 30 growing 10% → PEG 3.0.' },
+    pb: { t: 'P/B ratio (price to book)', w: 'Share price divided by book value per share (what shareholders would own on paper if everything were sold and debts paid).', r: 'Most useful for banks and asset-heavy firms. A P/B under 1 means the market values the company below its net assets. High-ROE companies justify high P/Bs.', e: 'Price ₹300, book value ₹100 per share → P/B 3.' },
+    earnings_yield: { t: 'Earnings yield', w: 'The P/E turned upside down: profit per share as a % of the price.', r: 'Compare it with the ~6.5% a 10-year government bond pays risk-free. An earnings yield above that leaves room for the extra risk of shares.', e: 'P/E 16 → earnings yield 1 ÷ 16 = 6.25%.' },
+    eps: { t: 'EPS (earnings per share)', w: 'Net profit divided by the number of shares: the profit that belongs to each share.', r: 'Rising EPS over the years is what ultimately pushes share prices up.', e: 'Net profit ₹1,000 crore, 50 crore shares → EPS ₹20.' },
+    book_value: { t: 'Book value per share', w: 'Shareholders’ equity (capital + reserves) divided by the number of shares.', r: 'Steady growth in book value means the company is retaining and compounding profits.', e: 'Equity ₹5,000 crore, 50 crore shares → book value ₹100 per share.' },
+    dividend_yield: { t: 'Dividend yield', w: 'Yearly dividends per share as a % of the share price.', r: 'Income you receive in cash. Very high yields can be a warning sign if the price has collapsed.', e: '₹10 dividend a year on a ₹400 share → 2.5% yield.' },
+    graham: { t: 'Graham number', w: 'A conservative maximum fair price from Benjamin Graham: √(22.5 × EPS × book value per share).', r: 'Built for slow-growing, asset-heavy value stocks. Quality growth companies almost always trade well above it, so treat it as a deep-value floor, not a target.', e: 'EPS ₹20, book value ₹150 → √(22.5 × 20 × 150) ≈ ₹260.' },
+    value_median_pe: { t: 'Value at own median P/E', w: 'Where the price would be if the stock returned to its usual P/E: EPS × median P/E.', r: 'A rough "re-rating" target. It assumes the old valuation is still deserved, which is not always true if growth has slowed.', e: 'Forward EPS ₹32 × median P/E 22 ≈ ₹704.' },
+    fair_band: { t: '12–20× earnings band', w: 'A conservative fair-value range: EPS multiplied by a P/E of 12 (low) to 20 (high). The Value Investing tab uses the same formula.', r: 'Price below the low end = cheap on plain-vanilla earnings. Fast growers usually trade above the band.', e: 'EPS ₹25 → fair band ₹300 – ₹500.' },
+    dcf: { t: 'Mini-DCF (discounted cash flow)', w: 'Values the share by projecting EPS 5 years ahead at an assumed growth rate, then discounting each year back to today at 12% (the return you could demand elsewhere).', r: 'Gives a low–high range for two growth assumptions. Very sensitive to the growth rate, so use it as a sanity check, not a precise target.', e: 'EPS ₹25 growing 10% a year, discounted at 12%, with an exit P/E of 12 → about ₹300.' },
+    analyst_target: { t: 'Analyst price target', w: 'The average 12-month price target published by brokerage analysts who cover the stock, with their lowest and highest targets.', r: 'Upside = how far the target is above today’s price. Analysts are often optimistic and late, so treat it as one input.', e: 'Mean target ₹600 vs price ₹500 → +20% upside.' },
+
+    // ── Growth ──
+    cagr: { t: 'CAGR (compound annual growth rate)', w: 'The steady yearly growth rate that would turn the starting value into the ending value.', r: '10–15% a year is good for a large company; 20%+ is excellent if it is consistent.', e: 'Sales ₹1,000 cr → ₹1,520 cr in 3 years = 15% CAGR (1.15 × 1.15 × 1.15 ≈ 1.52).' },
+    yoy: { t: 'YoY (year on year)', w: 'Compares a quarter with the same quarter a year earlier.', r: 'Removes seasonal effects (festive quarters, monsoon), so it is the fairest way to judge quarterly results.', e: 'Sep-2026 quarter profit ₹120 cr vs Sep-2025 ₹100 cr → +20% YoY.' },
+    qoq: { t: 'QoQ (quarter on quarter)', w: 'Compares a quarter with the quarter just before it.', r: 'Shows short-term direction, but seasonality can distort it.', e: 'Sales ₹520 cr this quarter vs ₹505 cr last quarter → +3% QoQ.' },
+    ttm: { t: 'TTM (trailing twelve months)', w: 'The total of the last four reported quarters.', r: 'More up to date than the last full financial year.', e: 'In November, TTM = the Dec, Mar, Jun and Sep quarters added together.' },
+    opm: { t: 'OPM (operating profit margin)', w: 'Operating profit (before interest, depreciation and tax) as a % of sales.', r: 'Shows pricing power and cost control. Stable or rising margins are good; falling margins often come before profit downgrades.', e: 'Sales ₹1,000 cr, operating profit ₹220 cr → OPM 22%.' },
+    eps_growth: { t: 'EPS growth', w: 'How fast profit per share is growing, usually as a 3- or 5-year CAGR.', r: 'Over the long run share prices tend to follow EPS. 10%+ a year is healthy.', e: 'EPS ₹10 → ₹16.1 in 5 years = 10% CAGR.' },
+
+    // ── Quality ──
+    roe: { t: 'ROE (return on equity)', w: 'Net profit as a % of shareholders’ money (equity).', r: '15%+ is good, 20%+ excellent. Check it is not inflated by heavy debt.', e: 'Profit ₹200 cr on equity of ₹1,000 cr → ROE 20%.' },
+    roce: { t: 'ROCE (return on capital employed)', w: 'Operating profit (EBIT) as a % of all capital used, debt included.', r: 'The best single measure of business quality: how much the company earns on every rupee invested. 15%+ good, 25%+ outstanding. Not meaningful for banks.', e: 'EBIT ₹300 cr on capital (equity + debt) of ₹1,200 cr → ROCE 25%.' },
+    cash_conversion: { t: 'Cash conversion (CFO ÷ PAT)', w: 'Operating cash flow divided by net profit (PAT), added up over 5 years.', r: 'Profits are an accounting figure; cash is real. Around 1× or more = profits are backed by cash. Well below 0.8× = money stuck in receivables or inventory, a classic warning sign.', e: '5-year operating cash ₹950 cr vs profit ₹1,000 cr → 0.95×, healthy.' },
+    fcf: { t: 'Free cash flow (FCF)', w: 'Operating cash flow minus capital expenditure: cash left after keeping the business running and growing.', r: 'FCF pays dividends, buybacks and debt. Positive in most years is a strong sign; persistently negative needs a good reason (heavy expansion).', e: 'Operating cash ₹500 cr − capex ₹200 cr = FCF ₹300 cr.' },
+    other_income: { t: 'Other income share', w: 'Income that is not from the main business (interest on cash, one-off gains) as a % of profit before tax.', r: 'Under 25% is fine. If a big chunk of profit is other income, the core business is weaker than the headline profit suggests.', e: 'PBT ₹400 cr including ₹160 cr of treasury income → 40%, a red flag.' },
+    debtor_days: { t: 'Debtor days', w: 'On average, how many days customers take to pay their bills.', r: 'Rising debtor days can mean the company is pushing sales on credit or customers are struggling; it also ties up cash.', e: 'Debtor days going from 60 to 95 in 3 years → a warning sign.' },
+    piotroski: { t: 'Piotroski F-score', w: 'A checklist by Prof. Joseph Piotroski scoring 1 point per test: profitable, positive cash flow, improving returns, cash above profit, falling leverage, no new shares, improving margin and asset turnover. (8 tests here; the current-ratio test needs data not available.)', r: '6+ = financially strengthening · 4–5 = mixed · 0–3 = weakening. Not used for banks.', e: 'A company passing 7 of 8 tests is improving on almost every front.' },
+    dividend_payout: { t: 'Dividend payout ratio', w: 'The % of net profit paid out as dividends.', r: 'High payout with little growth = mature cash cow; low payout = profits being reinvested. Above 100% is not sustainable.', e: 'Profit ₹100 cr, dividends ₹35 cr → 35% payout.' },
+    tax_rate: { t: 'Tax rate', w: 'Tax paid as a % of profit before tax.', r: 'India’s corporate rate is roughly 25%. Unusually low rates may come from one-off benefits that will not repeat.', e: 'PBT ₹100 cr, tax ₹25 cr → 25%.' },
+    profitable: { t: 'Profitable on a TTM basis', w: 'Whether the company made a net profit over the last 12 months.', r: 'A loss-making company has no meaningful P/E, and losses eat into net worth.', e: 'Net profit −₹15 cr over the last four quarters → fails this check.' },
+
+    // ── Financial health ──
+    de: { t: 'Debt to equity', w: 'Total borrowings divided by shareholders’ equity.', r: 'Below 0.5 comfortable · 0.5–1 moderate · above 1 high for most businesses. Not meaningful for banks and NBFCs, which borrow to lend.', e: 'Borrowings ₹300 cr, equity ₹1,000 cr → D/E 0.3.' },
+    icr: { t: 'Interest coverage', w: 'How many times operating profit (before interest and tax) covers the yearly interest bill.', r: 'Above 5× is safe; below 2.5× means a bad year could make it hard to pay lenders.', e: 'EBIT ₹500 cr, interest ₹50 cr → 10× coverage.' },
+    net_worth: { t: 'Net worth', w: 'Shareholders’ equity: share capital plus accumulated reserves. What would be left for shareholders after paying all liabilities.', r: 'Negative net worth means accumulated losses exceed all the capital put in, a serious red flag.', e: 'Capital ₹50 cr + reserves ₹950 cr = net worth ₹1,000 cr.' },
+    borrowings: { t: 'Borrowings growth', w: 'How fast the company’s debt is growing compared with its sales.', r: 'Debt growing much faster than sales means growth is being bought with borrowed money.', e: 'Debt growing 25% a year while sales grow 8% → fails the check.' },
+    dilution: { t: 'Equity dilution', w: 'The increase in share capital, i.e. new shares issued.', r: 'New shares split the same profit among more owners. Bonus issues, splits and mergers also raise share capital, so check the reason.', e: 'Share capital up 30% in 3 years from fund-raising → each share owns 23% less of the company.' },
+    lender: { t: 'Why lenders are treated differently', w: 'For banks, NBFCs and insurers, borrowing (deposits, bonds) is the raw material of the business.', r: 'Debt/equity, interest coverage, other income and Piotroski checks do not apply. Net-worth growth and ROE are used instead.', e: 'HDFC Bank’s "debt" is mostly customer deposits it lends out, so a high D/E is normal.' },
+
+    // ── Ownership ──
+    promoter: { t: 'Promoter holding', w: 'The % of shares owned by the founders or controlling group.', r: 'High holding (40%+) means the owners have skin in the game. Promoters selling steadily can be a warning; buying is usually a vote of confidence.', e: 'The Tata group holding ~72% of TCS.' },
+    pledge: { t: 'Promoter pledge', w: 'The % of the promoters’ own shares given to lenders as collateral for loans.', r: 'Below 5% fine · 20%+ risky · 50%+ serious. If the price falls, lenders can sell pledged shares, causing a sharper fall.', e: 'Promoters hold 50 lakh shares and pledged 30 lakh → 60% pledged.' },
+    fii_dii: { t: 'FII and DII holding', w: 'FII = foreign institutional investors (overseas funds). DII = domestic institutions (Indian mutual funds, LIC, insurers).', r: 'Institutions do deep research; their holding rising over a year is a positive signal, falling is a caution.', e: 'FII + DII going from 20% to 24% in a year → institutions are accumulating.' },
+    shareholders: { t: 'Number of shareholders', w: 'How many individual and institutional holders own the stock.', r: 'A sharp rise in small shareholders after a big rally can mean retail is chasing the stock.', e: 'Holders up from 2 lakh to 5 lakh in a year.' },
+    deals: { t: 'Bulk, block and insider deals', w: 'Bulk deal = one party trades over 0.5% of the company’s shares in a day. Block deal = a large trade (≥ ₹10 crore) in a special window. Insider = trades by directors and key staff.', r: 'Shows who is buying or selling large quantities.', e: 'A mutual fund buying 1% of the company in a block deal.' },
+
+    // ── Statements ──
+    consolidated: { t: 'Consolidated vs standalone', w: 'Consolidated accounts include subsidiaries; standalone covers only the parent company.', r: 'Consolidated is usually the truer picture of a group. This report uses consolidated when complete, otherwise standalone.', e: 'A company whose subsidiaries run the overseas business looks much smaller on a standalone basis.' },
+
+    // ── Trend & moving averages ──
+    dma: { t: 'Moving average (DMA / SMA)', w: 'The average closing price over the last N trading days, updated every day. DMA = daily moving average; SMA = simple moving average.', r: 'Price above a rising average = uptrend. The 50-DMA tracks the medium-term trend and the 200-DMA the long-term trend.', e: 'Average of the last 200 closes = ₹480 while price is ₹520 → 8% above the 200-DMA.' },
+    ema: { t: 'EMA (exponential moving average)', w: 'A moving average that gives more weight to recent prices, so it reacts faster.', r: 'EMA 9 above EMA 21 = short-term momentum is up.', e: 'After a sharp rally the EMA 9 rises above the EMA 21 within days.' },
+    dma200: { t: '200-day moving average', w: 'Average of the last 200 closing prices: the most watched long-term trend line.', r: 'Above a rising 200-DMA = long-term uptrend. Many institutions avoid stocks below a falling 200-DMA.', e: 'Price ₹520, 200-DMA ₹480 and rising → long-term uptrend intact.' },
+    cross: { t: 'Golden cross / death cross', w: 'Golden cross: the 50-DMA crosses above the 200-DMA. Death cross: it crosses below.', r: 'A golden cross often marks the start of a longer uptrend; a death cross the start of a downtrend. Both lag the price.', e: '50-DMA moves from ₹470 to ₹485 while the 200-DMA is ₹480 → golden cross.' },
+    template: { t: 'Minervini trend template', w: 'Seven conditions trader Mark Minervini uses to make sure a stock is in a strong Stage 2 uptrend before considering it.', r: '7/7 = textbook uptrend · 5–6 = mostly there · fewer = not in a confirmed uptrend.', e: 'Price above the 150- and 200-DMA, both rising, at least 30% above the 52-week low and within 25% of the high.' },
+    stage: { t: 'Weinstein stage', w: 'Stan Weinstein’s four market stages based on the 30-week moving average: 1 Basing, 2 Advancing, 3 Topping, 4 Declining.', r: 'Stage 2 (price above a rising 30-week average) is where most big gains happen. Avoid Stage 4.', e: 'After months moving sideways, price breaks above a now-rising 30-week MA → Stage 2 begins.' },
+    weekly_trend: { t: 'Weekly trend', w: 'Direction of the weekly chart, using the 10-week moving average.', r: 'Up = weekly close above a rising 10-week MA. Weekly trends filter out daily noise.', e: 'Weekly close ₹510, 10-week MA ₹495 and rising → "up".' },
+    slope200: { t: '200-DMA slope', w: 'How much the 200-day average has moved over the last month.', r: 'Positive = the long-term trend is still rising; negative = it has turned down.', e: '200-DMA from ₹470 to ₹480 in a month → +2.1%.' },
+
+    // ── Momentum ──
+    rsi: { t: 'RSI (Relative Strength Index)', w: 'A 0–100 gauge of how strong recent gains are compared with recent losses (14 days).', r: 'Above 70 = overbought (stretched) · below 30 = oversold · 50–70 = healthy uptrend zone. Strong stocks can stay overbought for weeks.', e: 'RSI 62 → rising steadily without being stretched.' },
+    macd: { t: 'MACD', w: 'Moving Average Convergence Divergence: the gap between the 12- and 26-day EMAs (the MACD line), and its own 9-day average (the signal line).', r: 'MACD above the signal line = momentum turning up. Above zero = the short-term trend is above the longer one.', e: 'MACD 4.2 vs signal 3.1 → bullish momentum; a growing histogram means it is accelerating.' },
+    adx: { t: 'ADX and +DI / −DI', w: 'ADX measures how strong a trend is (not its direction). +DI and −DI show whether buyers or sellers dominate.', r: 'ADX above 25 = strong trend · below 20 = no real trend. +DI above −DI = buyers in control.', e: 'ADX 32, +DI 28, −DI 14 → a strong uptrend.' },
+    stoch: { t: 'Stochastic %K / %D', w: 'Where today’s close sits within the last 14 days’ high–low range, from 0 to 100.', r: 'Above 80 = near the top of the range · below 20 = near the bottom. %D is a smoothed %K.', e: '14-day range ₹450–₹520, close ₹510 → %K ≈ 86.' },
+    returns: { t: 'Returns', w: 'Price change over 1 week, 1 month, 3, 6 and 12 months.', r: 'Compare with the Nifty row to see whether the stock beat the market.', e: 'Stock +18% in 6 months vs Nifty +7% → out-performed by 11 points.' },
+
+    // ── Relative strength ──
+    rs: { t: 'Relative strength vs Nifty', w: 'The stock’s return minus the Nifty 50’s return over the same period.', r: 'Positive = beating the market. Leaders tend to keep leading; laggards keep lagging.', e: 'Stock +12% in 3 months, Nifty +4% → +8 points out-performance.' },
+    mansfield: { t: 'Mansfield RS', w: 'The stock-to-Nifty price ratio compared with its own 52-week average.', r: 'Above 0 = currently stronger than the market relative to the past year; rising = improving.', e: 'Mansfield RS +12 → noticeably stronger than its usual relationship with the Nifty.' },
+    rs_line: { t: 'RS line', w: 'A line of the stock price divided by the Nifty 50.', r: 'A rising RS line means the stock is out-performing, even if both are falling.', e: 'Nifty −5%, stock −1% → the RS line still rises.' },
+
+    // ── Volume ──
+    rel_volume: { t: 'Relative volume', w: 'Today’s volume divided by the 20-day average volume.', r: 'Above 1.5× = unusual interest; a breakout on high relative volume is more trustworthy.', e: '30 lakh shares traded vs a 20 lakh average → 1.5×.' },
+    acc_dist: { t: 'Accumulation / distribution days', w: 'Accumulation day: price up on higher volume than the previous day. Distribution day: price down on higher volume.', r: 'More accumulation than distribution = institutions are buying. Clusters of distribution days often come before declines.', e: '12 accumulation vs 5 distribution days in 25 sessions → buyers in control.' },
+    updown: { t: 'Up/down volume ratio', w: 'Total volume on up days divided by total volume on down days over 50 sessions.', r: 'Above 1 = more volume when the price rises, i.e. buying pressure.', e: '4 crore shares on up days vs 2.5 crore on down days → 1.6.' },
+    obv: { t: 'OBV (on-balance volume)', w: 'A running total that adds the day’s volume on up days and subtracts it on down days.', r: 'Rising OBV = volume flowing into the stock. OBV rising while price is flat can come before a breakout.', e: 'Price flat for a month but OBV climbing → quiet accumulation.' },
+
+    // ── Volatility & risk ──
+    atr: { t: 'ATR (average true range)', w: 'The average daily price range over 14 days, including overnight gaps.', r: 'Shows typical daily movement and is used to set stop-losses. ATR above 4% of price = a volatile stock.', e: 'ATR ₹15 on a ₹500 share = 3%: a ₹15 move is an ordinary day.' },
+    hv: { t: 'Historical volatility', w: 'How much the price has swung over the last 20 days, scaled to a yearly %.', r: 'Under 25% calm · 25–40% normal for mid caps · above 50% very volatile.', e: 'HV 30% → roughly ±30% price swings over a year.' },
+    bollinger: { t: 'Bollinger Bands and %B', w: 'Bands drawn 2 standard deviations above and below the 20-day average. %B shows where price sits: 0 = lower band, 1 = upper band.', r: '%B above 1 = unusually strong (or stretched) · below 0 = unusually weak.', e: 'Bands ₹470–₹530, price ₹520 → %B ≈ 0.83.' },
+    squeeze: { t: 'Band width and squeeze', w: 'The distance between the Bollinger Bands as a % of price. A squeeze = band width in its lowest 20% of the last 6 months.', r: 'Quiet periods often come before big moves; a squeeze warns that a breakout or breakdown may be near.', e: 'Band width shrinks to 4% after months at 10% → squeeze.' },
+    extended: { t: 'Over-extended', w: 'How far the price has run above its 50-day average.', r: 'More than ~15% above the 50-DMA = stretched; a pullback becomes more likely.', e: 'Price ₹580, 50-DMA ₹500 → 16% above, over-extended.' },
+    drawdown: { t: 'Maximum drawdown', w: 'The biggest fall from a peak to a later low over the last year.', r: 'Shows the pain a holder would have sat through. Worse than −35% = a rough ride.', e: 'Peak ₹600, later low ₹420 → −30% drawdown.' },
+
+    // ── Levels ──
+    support: { t: 'Support and resistance', w: 'Support: a price zone where buyers have repeatedly stepped in. Resistance: a zone where sellers have repeatedly appeared. Touches = how many times price turned there.', r: 'More touches = a stronger level. A close above resistance on high volume is a breakout; a close below support is a breakdown.', e: 'The stock bounced off ₹450 three times → strong support at ₹450.' },
+    range52: { t: '52-week high / low', w: 'The highest and lowest prices of the last year.', r: 'Stocks near their 52-week high are often leaders; near the low, often laggards.', e: '52-week range ₹380–₹560, price ₹540 → 4% below the high.' },
+    pivot: { t: 'Weekly pivot points', w: 'Levels calculated from last week’s high, low and close: Pivot = (H + L + C) ÷ 3, with resistances R1/R2 above and supports S1/S2 below.', r: 'Many traders watch these as intraday and swing levels. Above the pivot = bullish bias for the week.', e: 'Last week H ₹520, L ₹480, C ₹510 → pivot ₹503.' },
+    fib: { t: 'Fibonacci retracements', w: 'Levels at 23.6%, 38.2%, 50%, 61.8% and 78.6% of the distance between the 52-week high and low.', r: 'Pullbacks in an uptrend often pause near the 38.2%–61.8% levels.', e: 'High ₹600, low ₹400 → 50% retracement at ₹500.' },
+
+    // ── Reference levels ──
+    entry: { t: 'Entry zone', w: 'A price band where buying would keep risk reasonable: between just above the stop and the current price (or the 50-DMA when it is close).', r: 'Educational reference only, not a recommendation.', e: 'Entry zone ₹495–₹510 with a stop at ₹470.' },
+    stop: { t: 'Stop-loss', w: 'A pre-decided price at which you exit to limit losses if the trade goes wrong.', r: 'Set here at the tighter of 2 × ATR below the price and just below the nearest support, but never closer than 1 × ATR so normal noise does not trigger it.', e: 'Price ₹510, ATR ₹12, support ₹478 → stop ≈ ₹486.' },
+    target: { t: 'Targets and R-multiple', w: 'Target = a price to take profit, usually the next resistance. R = risk per share (entry − stop). A 2R target makes twice what you risk.', r: 'Look for at least 2R so one winner pays for two losers.', e: 'Entry ₹510, stop ₹490 (risk ₹20), target ₹550 → 2R.' },
+
+    // ── Options & cross-checks ──
+    iv: { t: 'Implied volatility (IV)', w: 'The yearly volatility that option prices imply, i.e. how big a move the options market expects.', r: 'High IV = options are expensive and a big move is expected (often around results).', e: 'ATM IV 30% → the market expects roughly ±30% movement over a year.' },
+    iv_rank: { t: 'IV rank / percentile', w: 'Where today’s implied volatility sits compared with its own past year (0–100).', r: 'High (70+) = options are expensive vs usual; low = cheap.', e: 'IV rank 85 → options are pricier than on most days of the past year.' },
+    pcr: { t: 'Put-call ratio (OI)', w: 'Open interest in put options divided by open interest in call options.', r: 'Above 1 = more puts, often read as hedging or bearish positioning; very high readings are sometimes contrarian-bullish.', e: '9 lakh puts vs 12 lakh calls open → PCR 0.75.' },
+    max_pain: { t: 'Max pain', w: 'The strike price at which option buyers as a group would lose the most money at expiry.', r: 'Some traders believe prices drift toward max pain near expiry. A weak signal.', e: 'Max pain ₹2,480 with the stock at ₹2,460.' },
+    scorecard: { t: 'Tickertape scorecard', w: 'Tickertape’s own independent ratings of performance, valuation, growth, profitability, entry point and red flags.', r: 'Use it as a second opinion next to this report’s scores. For valuation, "Low" = cheap; for red flags, "Low" = few red flags.', e: 'Profitability High, Valuation Low → a profitable company at an undemanding price.' },
+    tapetide_score: { t: 'Tapetide score', w: 'Tapetide’s own 0–100 composite across financial health, growth, momentum, ownership, quality and valuation.', r: 'An independent cross-check; percentile shows where it ranks among ~4,500 stocks.', e: 'Score 62, percentile 93 → better than 93% of listed stocks on their model.' },
+    concall: { t: 'Earnings call (concall)', w: 'The conference call where management discusses quarterly results with analysts. Shown here as an AI summary of the transcript.', r: 'Look for guidance (management’s outlook) and the risks they admit to.', e: '"Margins expected to stay at 24% this year; North America demand still weak."' },
+};
+
+// Text pattern → term. Order matters: specific patterns first.
+const TF_TERM_RULES = [
+    // scores & verdict
+    [/^techno ?funda$/i, 'technofunda'], [/^fundamental$|fundamental score/i, 'fundamental_score'], [/^technical$|technical score/i, 'technical_score'],
+    [/quality in momentum|good business|momentum without|weak on both|mixed signals/i, 'quadrant'],
+    [/governance/i, 'governance'], [/data confidence/i, 'confidence'],
+    // pillar names / checklist titles (anchored so "Risks / weaknesses" etc. don't match)
+    [/^quality( checks)?$/i, 'p_quality'], [/^growth( checks)?$/i, 'p_growth'], [/^financial health( checks)?$|^balance sheet$/i, 'p_health'],
+    [/^valuation( checks)?$/i, 'p_valuation'], [/^ownership( checks)?$/i, 'p_ownership'], [/^trend( checks)?$/i, 'p_trend'],
+    [/^momentum( checks)?$/i, 'p_momentum'], [/^relative strength( vs nifty 50)?$/i, 'p_rs'], [/^volume( checks)?$/i, 'p_volume'],
+    [/^risk ?(&|\/) ?volatility/i, 'p_risk'],
+    // reference levels before ATR / DMA
+    [/entry zone/i, 'entry'], [/stop-loss/i, 'stop'], [/^target \d|^reference levels/i, 'target'],
+    // structure
+    [/minervini|trend template/i, 'template'], [/weinstein|^stage/i, 'stage'], [/piotroski/i, 'piotroski'],
+    [/golden|death|50\/200 cross|50-DMA above 200-DMA/i, 'cross'], [/200-DMA slope|200-DMA rising|200-DMA trending/i, 'slope200'],
+    [/weekly trend/i, 'weekly_trend'], [/weekly pivot|^pivot/i, 'pivot'], [/fibonacci/i, 'fib'],
+    [/over-extended/i, 'extended'],
+    // ownership before YoY/QoQ/CAGR (e.g. "Promoter change (QoQ)")
+    [/pledge/i, 'pledge'], [/promoter/i, 'promoter'], [/fii|dii|institution/i, 'fii_dii'], [/shareholders/i, 'shareholders'],
+    [/bulk|block|insider/i, 'deals'], [/^shareholding$/i, 'fii_dii'],
+    // valuation
+    [/value at own median/i, 'value_median_pe'], [/forward p\/e/i, 'forward_pe'],
+    [/median p\/e|p\/e at or below its own/i, 'median_pe'],
+    [/\bpeg\b/i, 'peg'], [/earnings yield/i, 'earnings_yield'], [/graham/i, 'graham'], [/12–20×|earnings band/i, 'fair_band'],
+    [/dcf/i, 'dcf'], [/analyst|upside to mean target/i, 'analyst_target'],
+    [/company is profitable|profitable on a ttm/i, 'profitable'],
+    [/\bp\/b\b/i, 'pb'], [/\bp\/e\b|^pe\b/i, 'pe'], [/market cap/i, 'market_cap'],
+    // balance sheet before CAGR (e.g. "Borrowings CAGR 3Y")
+    [/debt \/ equity|debt to equity/i, 'de'], [/^leverage tests/i, 'lender'], [/interest coverage/i, 'icr'], [/net worth/i, 'net_worth'],
+    [/borrowings/i, 'borrowings'], [/dilution|share capital change/i, 'dilution'],
+    // growth / earnings
+    [/eps .*cagr|eps growth/i, 'eps_growth'], [/\beps\b/i, 'eps'], [/book value/i, 'book_value'], [/dividend yield|div\. yield/i, 'dividend_yield'],
+    [/dividend payout/i, 'dividend_payout'], [/tax rate/i, 'tax_rate'],
+    [/cagr/i, 'cagr'], [/\byoy\b/i, 'yoy'], [/\bqoq\b/i, 'qoq'], [/^ttm$/i, 'ttm'],
+    [/operating margin|\bopm\b/i, 'opm'],
+    // quality
+    [/roce/i, 'roce'], [/\broe\b|capital adequacy/i, 'roe'], [/cash conversion|convert to cash|\bcfo\b/i, 'cash_conversion'],
+    [/free cash flow|\bfcf\b/i, 'fcf'], [/other income|core earnings/i, 'other_income'], [/debtor days/i, 'debtor_days'],
+    // averages & momentum
+    [/^price, 50-dma/i, 'dma'], [/^ema\b|ema 9|ema 21/i, 'ema'], [/200-dma|sma 200/i, 'dma200'], [/\bdma\b|-dma\b|^sma\b|moving average/i, 'dma'],
+    [/rsi/i, 'rsi'], [/macd/i, 'macd'], [/adx/i, 'adx'], [/stochastic/i, 'stoch'], [/^returns$|3-month return/i, 'returns'],
+    [/mansfield/i, 'mansfield'], [/rs line/i, 'rs_line'], [/outperforming nifty|out \/ under-performance|relative strength/i, 'rs'],
+    // volume
+    [/relative volume|20-day volume|avg volume/i, 'rel_volume'], [/accumulation|distribution/i, 'acc_dist'], [/up\/down volume/i, 'updown'], [/\bobv\b/i, 'obv'],
+    // volatility & levels
+    [/\batr\b/i, 'atr'], [/historical volatility/i, 'hv'], [/band width|squeeze/i, 'squeeze'], [/bollinger/i, 'bollinger'],
+    [/drawdown/i, 'drawdown'], [/52-week|52w/i, 'range52'], [/^key levels$|^support$|^resistance$/i, 'support'],
+    // options & cross-checks
+    [/implied vol|atm iv/i, 'iv'], [/iv rank/i, 'iv_rank'], [/put-call/i, 'pcr'], [/max pain/i, 'max_pain'],
+    [/tickertape scorecard/i, 'scorecard'], [/tapetide score/i, 'tapetide_score'], [/earnings call/i, 'concall'],
+    [/^consolidated$|^standalone$/i, 'consolidated'],
+];
+
+function tfTermKey(text) {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!s || s.length > 90) return null;
+    for (const [re, key] of TF_TERM_RULES) if (re.test(s)) return TF_GLOSSARY[key] ? key : null;
+    return null;
+}
+
+function tfInfoBtn(key) {
+    const g = TF_GLOSSARY[key];
+    if (!g) return '';
+    return `<button type="button" class="tf-i" data-term="${key}" aria-haspopup="dialog" aria-label="What is ${tfEsc(g.t)}?">i</button>`;
+}
+
+/** After a render: add an ⓘ next to every label that matches a glossary term. */
+function tfAttachInfo(root) {
+    if (!root) return;
+    const sel = ['.tf-metric > span', '.tf-check-label', '.tf-pillar-name', '.tf-card h4', '.tf-card h5', '.tf-hero-stats > div > span',
+        '.tf-gauge-text span', '.tf-quadrant', '.tf-plan-grid > div > span', '.tf-table th', '.tf-table:not(.tf-table--wrap) td:first-child', '.tf-hero-tags .tf-tag'];
+    root.querySelectorAll(sel.join(',')).forEach(el => {
+        if (el.querySelector('.tf-i') || el.closest('.tf-i')) return;
+        // Use the label text without any trailing muted note, e.g. "Reference levels (educational…)".
+        const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim() || el.textContent;
+        const key = tfTermKey(own);
+        if (key) el.insertAdjacentHTML('beforeend', tfInfoBtn(key));
+    });
+}
+
+// ── popover ──
+
+let _tfTermBtn = null;
+
+function tfShowTerm(btn) {
+    const key = btn.dataset.term, g = TF_GLOSSARY[key];
+    if (!g) return;
+    let pop = document.getElementById('tf-term-pop');
+    if (!pop) {
+        pop = document.createElement('div');
+        pop.id = 'tf-term-pop';
+        pop.className = 'tf-term-pop';
+        pop.setAttribute('role', 'dialog');
+        document.body.appendChild(pop);
+    }
+    if (_tfTermBtn === btn && !pop.hidden) { tfHideTerm(); return; }
+    if (_tfTermBtn) _tfTermBtn.setAttribute('aria-expanded', 'false');
+    _tfTermBtn = btn;
+    btn.setAttribute('aria-expanded', 'true');
+    pop.setAttribute('aria-label', g.t);
+    pop.innerHTML = `
+        <div class="tf-term-head"><b>${tfEsc(g.t)}</b>
+            <button type="button" class="tf-term-close" aria-label="Close" onclick="tfHideTerm(true)">×</button></div>
+        <p><span class="tf-term-k">What it is</span>${tfEsc(g.w)}</p>
+        <p><span class="tf-term-k">How to read it</span>${tfEsc(g.r)}</p>
+        ${g.e ? `<p class="tf-term-ex"><span class="tf-term-k">Example</span>${tfEsc(g.e)}</p>` : ''}`;
+    pop.hidden = false;
+    // Position below the button (above if no room), clamped to the viewport.
+    const r = btn.getBoundingClientRect();
+    const w = Math.min(340, window.innerWidth - 16);
+    pop.style.width = w + 'px';
+    const h = pop.offsetHeight;
+    let left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+    let top = r.bottom + 8;
+    if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 8);
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+}
+
+function tfHideTerm(refocus) {
+    const pop = document.getElementById('tf-term-pop');
+    if (pop) pop.hidden = true;
+    if (_tfTermBtn) {
+        _tfTermBtn.setAttribute('aria-expanded', 'false');
+        if (refocus) _tfTermBtn.focus();
+    }
+    _tfTermBtn = null;
+}
+
+document.addEventListener('click', e => {
+    const btn = e.target.closest('.tf-i');
+    if (btn) { e.preventDefault(); e.stopPropagation(); tfShowTerm(btn); return; }
+    if (!e.target.closest('#tf-term-pop')) tfHideTerm();
+}, true);
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && _tfTermBtn) tfHideTerm(true); });
+window.addEventListener('resize', () => tfHideTerm());
+document.addEventListener('scroll', e => { if (_tfTermBtn && !e.target.closest?.('#tf-term-pop')) tfHideTerm(); }, true);

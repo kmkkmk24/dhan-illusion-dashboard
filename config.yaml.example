@@ -72,6 +72,20 @@ backup:
   time: "20:00"
   keep_last: 30
 
+# ── TechnoFunda Analysis tab (all optional; these are the defaults) ──
+# Fundamentals come from the Tapetide MCP (tapetide.token, the same token the
+# Value Investing tab uses; free plan = 50 calls/day, ~7 per new stock); price history comes from Dhan.
+techno_funda:
+  cache_minutes: 15          # reuse a report for this long unless "Refresh" is pressed
+  fundamentals_cache_hours: 24  # Tapetide data saved on disk; reopening a stock costs no calls
+  tapetide_extras: ["forecasts", "concall", "news", "annual_report"]  # also: deals, score, corporate_actions, credit, options (1 call each)
+  history_days: 730          # daily candles fetched for technicals (2 years)
+  gsec_10y_yield: 6.5        # benchmark for the earnings-yield check
+  tapetide_concurrency: 6    # parallel Tapetide calls per analysis
+  verdict_weights:
+    fundamental: 0.55
+    technical: 0.45
+
 # ── Server Settings ──
 server:
   host: "127.0.0.1"

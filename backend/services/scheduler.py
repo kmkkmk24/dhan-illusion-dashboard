@@ -24,8 +24,6 @@ _last_scan_result: dict = {}
 _last_scan_time: datetime | None = None
 _last_sector_report_time: datetime | None = None
 _last_sector_report_result: dict = {}
-_last_market_direction_notify_time: datetime | None = None
-_last_market_direction_notify_result: dict = {}
 
 
 def is_market_day() -> bool:
@@ -187,35 +185,6 @@ async def _poll_telegram_callbacks():
         logger.info("Processed %s Telegram drill-down callbacks", result.get("handled"))
 
 
-async def _run_daily_market_direction_notify():
-    """Send daily AI market direction prediction to Telegram at 6 PM IST."""
-    global _last_market_direction_notify_time, _last_market_direction_notify_result
-    if not is_market_day():
-        logger.info("Skipping market direction notify — not a market day")
-        return
-
-    from backend.models.database import get_session_factory
-    from backend.services.market_direction import MarketDirectionPredictor
-
-    db = get_session_factory()()
-    try:
-        predictor = MarketDirectionPredictor(db)
-        result = await predictor.notify_latest_prediction_to_telegram(horizon="tomorrow")
-        _last_market_direction_notify_result = result
-        _last_market_direction_notify_time = datetime.now()
-        logger.info(
-            "Daily market direction notify complete: ok=%s msg=%s",
-            bool(result.get("ok")),
-            result.get("message"),
-        )
-    except Exception as e:
-        logger.error("Daily market direction notify failed: %s", e, exc_info=True)
-        _last_market_direction_notify_time = datetime.now()
-        _last_market_direction_notify_result = {"ok": False, "error": str(e)}
-    finally:
-        db.close()
-
-
 async def _run_order_safety_jobs():
     """
     Every 15s on market days: protect newly-filled entries (OCO / SL GTT) and
@@ -363,20 +332,6 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Daily AI prediction push to Telegram (weekdays, 6:00 PM IST).
-    _scheduler.add_job(
-        _run_daily_market_direction_notify,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour=18,
-            minute=0,
-            timezone="Asia/Kolkata",
-        ),
-        id="market_direction_daily_6pm",
-        name="Market Direction Telegram (6 PM)",
-        replace_existing=True,
-    )
-
     # Protection placement + manual target exits (market hours, every 15s).
     _scheduler.add_job(
         _run_order_safety_jobs,
@@ -444,7 +399,5 @@ def get_scheduler_status() -> dict:
         "last_scan_result": _last_scan_result,
         "last_sector_report_time": str(_last_sector_report_time) if _last_sector_report_time else None,
         "last_sector_report_result": _last_sector_report_result,
-        "last_market_direction_notify_time": str(_last_market_direction_notify_time) if _last_market_direction_notify_time else None,
-        "last_market_direction_notify_result": _last_market_direction_notify_result,
         "is_market_day": is_market_day(),
     }

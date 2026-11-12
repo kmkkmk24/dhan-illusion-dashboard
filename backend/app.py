@@ -15,8 +15,8 @@ from backend.api import (
     index_trading,
     value_investing,
     auth,
-    market_direction,
     ipos,
+    techno_funda,
 )
 from backend.services.auth_service import ensure_seed_users, get_user_by_session
 
@@ -99,7 +99,7 @@ app.include_router(journal.router)
 app.include_router(settings.router)
 app.include_router(index_trading.router)
 app.include_router(value_investing.router)
-app.include_router(market_direction.router)
+app.include_router(techno_funda.router)
 app.include_router(ipos.router)
 
 
